@@ -17,7 +17,10 @@ if (!DATABASE_URL) {
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 1,
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 30000
 });
 
 function nowSeconds() {
@@ -518,7 +521,7 @@ app.get("/api/song-timelines/youtube/:videoId", async (req, res) => {
 });
 
 app.post("/api/song-timelines", async (req, res) => {
-  const client = await pool.connect();
+  let client;
 
   try {
     const body = req.body || {};
@@ -541,6 +544,7 @@ app.post("/api/song-timelines", async (req, res) => {
     });
 
     const now = nowSeconds();
+    client = await pool.connect();
     await client.query("begin");
     const timelineResult = await client.query(
       `insert into song_timelines (song_id, created_by_machine_id, source, created_at, updated_at)
@@ -572,10 +576,14 @@ app.post("/api/song-timelines", async (req, res) => {
       timeline: communityTimeline
     });
   } catch (error) {
-    await client.query("rollback").catch(() => {});
+    if (client) {
+      await client.query("rollback").catch(() => {});
+    }
     return res.status(500).json({ ok: false, message: "Timeline upload failed: " + error.message });
   } finally {
-    client.release();
+    if (client) {
+      client.release();
+    }
   }
 });
 
