@@ -15,6 +15,27 @@ if (!DATABASE_URL) {
   console.warn("DATABASE_URL is not set. Timeline server needs a separate Supabase/PostgreSQL database.");
 }
 
+let schemaReady = false;
+let schemaErrorMessage = "";
+
+function getDatabaseUrlInfo() {
+  try {
+    const url = new URL(DATABASE_URL || "");
+    return {
+      protocol: url.protocol,
+      user: decodeURIComponent(url.username || ""),
+      hasPassword: Boolean(url.password),
+      host: url.hostname,
+      port: url.port || "(default)",
+      database: url.pathname.replace(/^\//, "") || "(none)"
+    };
+  } catch (error) {
+    return { error: "Invalid DATABASE_URL: " + error.message };
+  }
+}
+
+console.log("Database URL info:", getDatabaseUrlInfo());
+
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -496,9 +517,18 @@ app.get("/", (req, res) => {
 app.get("/healthz", async (req, res) => {
   try {
     await pool.query("select 1");
-    res.json({ ok: true, service: "timeline", db: true, time: nowSeconds() });
+    res.json({ ok: true, service: "timeline", db: true, schemaReady, time: nowSeconds() });
   } catch (error) {
-    res.status(500).json({ ok: false, service: "timeline", db: false, message: error.message });
+    res.status(500).json({
+      ok: false,
+      service: "timeline",
+      db: false,
+      schemaReady,
+      message: error.message,
+      schemaError: schemaErrorMessage,
+      databaseUrlInfo: getDatabaseUrlInfo(),
+      time: nowSeconds()
+    });
   }
 });
 
@@ -769,11 +799,16 @@ app.get("/admin/timelines", (req, res) => {
 
 ensureSchema()
   .then(() => {
+    schemaReady = true;
+    console.log("Timeline schema ready.");
+  })
+  .catch(error => {
+    schemaReady = false;
+    schemaErrorMessage = error.message;
+    console.error("Failed to initialize timeline schema:", error);
+  })
+  .finally(() => {
     app.listen(PORT, () => {
       console.log(`PluginLocker timeline server running on port ${PORT}`);
     });
-  })
-  .catch(error => {
-    console.error("Failed to initialize timeline schema:", error);
-    process.exit(1);
   });
