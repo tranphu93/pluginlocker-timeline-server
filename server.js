@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 
@@ -80,17 +80,38 @@ function normalizeYouTubeVideoId(value) {
   return "";
 }
 
-function normalizeTimelineKey(value) {
+function normalizeTimelineKey(value, scale = "") {
   const key = String(value || "").trim();
-  const aliases = {
-    "C#": "DB",
-    "D#": "EB",
-    "F#": "GB",
-    "G#": "AB",
-    "A#": "BB"
-  };
-  const normalized = key.replace("\u266f", "#").replace("\u266d", "B").toUpperCase();
-  return aliases[normalized] || normalized;
+  if (!key) return "";
+
+  const token = key
+    .replace("\u266f", "#")
+    .replace("\u266d", "b")
+    .replace(/([A-Ga-g])b$/, (_, root) => `${root.toUpperCase()}B`)
+    .replace(/([A-Ga-g])#$/, (_, root) => `${root.toUpperCase()}#`)
+    .toUpperCase();
+
+  const normalized = {
+    "C": "C",
+    "C#": "C#",
+    "DB": "C#",
+    "D": "D",
+    "D#": "Eb",
+    "EB": "Eb",
+    "E": "E",
+    "F": "F",
+    "F#": "F#",
+    "GB": "F#",
+    "G": "G",
+    "G#": "G#",
+    "AB": "G#",
+    "A": "A",
+    "A#": "Bb",
+    "BB": "Bb",
+    "B": "B"
+  }[token] || key;
+
+  return String(scale).trim() === "Major" ? ({ "C#": "Db", "G#": "Ab" }[normalized] || normalized) : normalized;
 }
 
 function normalizeScale(value) {
@@ -115,8 +136,8 @@ function parseTimelineMarkers(markers) {
   return markers
     .map((marker, index) => ({
       timeMs: Math.max(0, Math.floor(Number(marker.timeMs || marker.time_ms || 0))),
-      key: normalizeTimelineKey(marker.key),
       scale: normalizeScale(marker.scale),
+      key: normalizeTimelineKey(marker.key, normalizeScale(marker.scale)),
       markerType: normalizeMarkerType(marker.markerType || marker.marker_type, index),
       confidence: Math.max(0, Math.min(1, Number(marker.confidence ?? 1)))
     }))
@@ -151,8 +172,8 @@ function aggregateTimelineMarkers(rows, timelineCount) {
   for (const row of rows) {
     const marker = {
       timeMs: Number(row.time_ms || 0),
-      key: normalizeTimelineKey(row.key),
       scale: normalizeScale(row.scale),
+      key: normalizeTimelineKey(row.key, normalizeScale(row.scale)),
       markerType: row.marker_type || "modulation",
       confidence: Math.max(0, Math.min(1, Number(row.confidence ?? 1)))
     };
@@ -553,8 +574,8 @@ async function getTimelineSongDetail(songId) {
     markersByTimeline.get(key).push({
       markerId: String(marker.id),
       timeMs: Number(marker.time_ms || 0),
-      key: marker.key || "",
-      scale: marker.scale || "",
+      key: normalizeTimelineKey(marker.key, normalizeScale(marker.scale)),
+      scale: normalizeScale(marker.scale),
       markerType: marker.marker_type || "",
       confidence: Number(marker.confidence || 0)
     });
@@ -924,3 +945,4 @@ ensureSchema()
       console.log(`PluginLocker timeline server running on port ${PORT}`);
     });
   });
+
