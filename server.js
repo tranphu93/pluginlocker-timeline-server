@@ -854,9 +854,10 @@ app.get("/admin/timelines", (req, res) => {
     .toolbar { display:flex; gap:10px; align-items:center; justify-content:space-between; margin-bottom:12px; }
     .muted { color:#8b94a7; font-size:12px; }
     .pill { display:inline-block; border-radius:999px; padding:3px 8px; font-size:12px; font-weight:700; background:rgba(59,130,246,.18); color:#93c5fd; }
+    .song-table-wrap { overflow:auto; max-height:720px; border-radius:8px; }
     table { width:100%; min-width:1120px; border-collapse:separate; border-spacing:0; table-layout:fixed; }
     th,td { padding:12px 10px; border-bottom:1px solid #292f3a; text-align:left; vertical-align:top; font-size:13px; line-height:1.45; overflow-wrap:anywhere; }
-    th { color:#a8b0c0; background:#11141b; }
+    th { color:#a8b0c0; background:#11141b; position:sticky; top:0; z-index:1; }
     .actions { display:flex; gap:8px; flex-wrap:wrap; }
     .summary-lines { display:grid; gap:6px; }
     .summary-line { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
@@ -880,14 +881,14 @@ app.get("/admin/timelines", (req, res) => {
       <div style="flex:0 0 auto; align-self:end"><button id="saveTokenBtn" class="secondary" type="button">Luu token</button></div>
     </div><div id="summaryText" class="muted" style="margin-top:12px">Chua tai du lieu.</div></section>
     <section class="card"><div class="toolbar"><h2 style="margin:0">Bai da upload</h2><span class="pill" id="songCount">0 bai</span></div>
-      <div style="overflow-x:auto"><table><thead><tr><th style="width:220px">YouTube</th><th style="width:260px">Ten bai</th><th style="width:110px">Thoi luong</th><th>Ket qua tong hop</th><th style="width:180px">Cap nhat</th><th style="width:220px">Thao tac</th></tr></thead><tbody id="songRows"></tbody></table></div>
+      <div class="song-table-wrap"><table><thead><tr><th style="width:220px">YouTube</th><th style="width:260px">Ten bai</th><th style="width:110px">Thoi luong</th><th>Ket qua tong hop</th><th style="width:180px">Cap nhat</th><th style="width:220px">Thao tac</th></tr></thead><tbody id="songRows"></tbody></table></div>
     </section>
     <section class="detail-grid"><div class="card"><h2 style="margin-top:0">Chi tiet timeline</h2><div id="detailBox" class="muted">Chon mot bai de xem timeline.</div></div><div class="card"><h2 style="margin-top:0">Ket qua API</h2><pre id="resultBox">Chua co thao tac.</pre></div></section>
   </main>
   <script>
     let songs = []; let selectedSong = null; const $ = id => document.getElementById(id);
     function getToken(){ return $("adminToken").value.trim(); }
-    function restoreToken(){ $("adminToken").value = localStorage.getItem("pluginlockerTimelineAdminToken") || ""; }
+    function restoreToken(){ const params=new URLSearchParams(window.location.search); const urlToken=params.get("adminToken")||""; const storedToken=localStorage.getItem("pluginlockerTimelineAdminToken")||""; $("adminToken").value=urlToken||storedToken; if(urlToken){ localStorage.setItem("pluginlockerTimelineAdminToken",urlToken); window.history.replaceState({},document.title,window.location.pathname); } }
     function saveToken(){ localStorage.setItem("pluginlockerTimelineAdminToken", getToken()); showResult({ok:true,message:"Da luu timeline token trong trinh duyet nay."}); }
     function showResult(obj){ $("resultBox").textContent = typeof obj === "string" ? obj : JSON.stringify(obj,null,2); }
     function escapeText(value){ return String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;"); }
