@@ -216,6 +216,29 @@ function aggregateTimelineMarkers(rows, timelineCount) {
     }));
 }
 
+function formatAggregateSummary(markers) {
+  if (!Array.isArray(markers) || markers.length === 0) {
+    return "Chua co ket qua";
+  }
+
+  return markers
+    .slice(0, 4)
+    .map(marker => {
+      const percent = Math.round(Math.max(0, Math.min(1, Number(marker.confidence || 0))) * 100);
+      const time = formatDuration(Number(marker.timeMs || 0) / 1000);
+      const label = marker.markerType === "initial_key" ? "dau bai" : "len tone";
+      return `${label} ${marker.key} ${marker.scale} ${percent}% @ ${time}`;
+    })
+    .join("; ");
+}
+
+function formatDuration(seconds) {
+  const safeSeconds = Math.max(0, Math.floor(Number(seconds) || 0));
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainSeconds = safeSeconds % 60;
+  return `${minutes}:${String(remainSeconds).padStart(2, "0")}`;
+}
+
 async function ensureSchema() {
   await pool.query(`
     create table if not exists songs (
@@ -425,7 +448,7 @@ async function listTimelineSongs(searchText = "") {
     values
   );
 
-  return result.rows.map(row => ({
+  const songs = result.rows.map(row => ({
     songId: String(row.id),
     youtubeVideoId: row.youtube_video_id || "",
     title: row.title || "",
@@ -438,8 +461,47 @@ async function listTimelineSongs(searchText = "") {
     useCount: Number(row.use_count || 0),
     createdAt: Number(row.created_at || 0),
     updatedAt: Number(row.updated_at || 0),
-    lastTimelineAt: Number(row.last_timeline_at || 0)
+    lastTimelineAt: Number(row.last_timeline_at || 0),
+    aggregateMarkers: [],
+    aggregateSummary: "Chua co ket qua"
   }));
+
+  if (songs.length === 0) {
+    return songs;
+  }
+
+  const songIds = songs.map(song => Number(song.songId));
+  const markerResult = await pool.query(
+    `select
+       t.song_id,
+       m.time_ms, m.key, m.scale, m.marker_type, m.confidence,
+       t.vote_up, t.vote_down, t.use_count
+     from timeline_markers m
+     join song_timelines t on t.id = m.timeline_id
+     where t.song_id = any($1::bigint[])
+     order by t.song_id asc, m.time_ms asc`,
+    [songIds]
+  );
+
+  const markersBySong = new Map();
+  for (const row of markerResult.rows) {
+    const key = String(row.song_id);
+    if (!markersBySong.has(key)) {
+      markersBySong.set(key, []);
+    }
+
+    markersBySong.get(key).push(row);
+  }
+
+  for (const song of songs) {
+    const markers = aggregateTimelineMarkers(
+      markersBySong.get(song.songId) || [],
+      song.timelineCount);
+    song.aggregateMarkers = markers;
+    song.aggregateSummary = formatAggregateSummary(markers);
+  }
+
+  return songs;
 }
 
 async function getTimelineSongDetail(songId) {
@@ -466,10 +528,16 @@ async function getTimelineSongDetail(songId) {
   let markerRows = [];
   if (timelineIds.length > 0) {
     const markerResult = await pool.query(
-      `select *
-       from timeline_markers
-       where timeline_id = any($1::bigint[])
-       order by time_ms asc, id asc`,
+      `select
+         m.*,
+         t.song_id,
+         t.vote_up,
+         t.vote_down,
+         t.use_count
+       from timeline_markers m
+       join song_timelines t on t.id = m.timeline_id
+       where m.timeline_id = any($1::bigint[])
+       order by m.time_ms asc, m.id asc`,
       [timelineIds]
     );
     markerRows = markerResult.rows;
@@ -492,12 +560,19 @@ async function getTimelineSongDetail(songId) {
     });
   }
 
+  const aggregateMarkers = aggregateTimelineMarkers(markerRows, timelineResult.rows.length);
+
   return {
     songId: String(song.id),
     youtubeVideoId: song.youtube_video_id || "",
     title: song.title || "",
     artist: song.artist || "",
     durationSeconds: Number(song.duration_seconds || 0),
+    timelineCount: timelineResult.rows.length,
+    markerCount: markerRows.length,
+    useCount: timelineResult.rows.reduce((total, row) => total + Number(row.use_count || 0), 0),
+    aggregateMarkers,
+    aggregateSummary: formatAggregateSummary(aggregateMarkers),
     createdAt: Number(song.created_at || 0),
     updatedAt: Number(song.updated_at || 0),
     timelines: timelineResult.rows.map(row => ({
@@ -783,6 +858,13 @@ app.get("/admin/timelines", (req, res) => {
     th,td { padding:12px 10px; border-bottom:1px solid #292f3a; text-align:left; vertical-align:top; font-size:13px; line-height:1.45; overflow-wrap:anywhere; }
     th { color:#a8b0c0; background:#11141b; }
     .actions { display:flex; gap:8px; flex-wrap:wrap; }
+    .summary-lines { display:grid; gap:6px; }
+    .summary-line { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .summary-key { font-weight:750; color:#f8fafc; }
+    .summary-meta { color:#93c5fd; font-weight:750; }
+    .stat-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin:12px 0; }
+    .stat { border:1px solid #2a2f3a; border-radius:10px; padding:10px; background:#11141b; }
+    .stat b { display:block; font-size:18px; margin-top:4px; }
     pre { white-space:pre-wrap; word-break:break-word; background:#0f1117; border:1px solid #2a2f3a; border-radius:10px; padding:10px; min-height:44px; max-height:300px; overflow:auto; color:#cbd5e1; }
     .detail-grid { display:grid; grid-template-columns:minmax(420px,1fr) minmax(420px,1fr); gap:14px; align-items:start; }
     @media (max-width: 980px) { .detail-grid { grid-template-columns:1fr; } header { align-items:flex-start; flex-direction:column; } }
@@ -798,7 +880,7 @@ app.get("/admin/timelines", (req, res) => {
       <div style="flex:0 0 auto; align-self:end"><button id="saveTokenBtn" class="secondary" type="button">Luu token</button></div>
     </div><div id="summaryText" class="muted" style="margin-top:12px">Chua tai du lieu.</div></section>
     <section class="card"><div class="toolbar"><h2 style="margin:0">Bai da upload</h2><span class="pill" id="songCount">0 bai</span></div>
-      <div style="overflow-x:auto"><table><thead><tr><th style="width:220px">YouTube</th><th>Ten bai</th><th style="width:120px">Thoi luong</th><th style="width:130px">Timeline</th><th style="width:130px">Moc</th><th style="width:130px">Luot dung</th><th style="width:180px">Cap nhat</th><th style="width:240px">Thao tac</th></tr></thead><tbody id="songRows"></tbody></table></div>
+      <div style="overflow-x:auto"><table><thead><tr><th style="width:220px">YouTube</th><th style="width:260px">Ten bai</th><th style="width:110px">Thoi luong</th><th>Ket qua tong hop</th><th style="width:180px">Cap nhat</th><th style="width:220px">Thao tac</th></tr></thead><tbody id="songRows"></tbody></table></div>
     </section>
     <section class="detail-grid"><div class="card"><h2 style="margin-top:0">Chi tiet timeline</h2><div id="detailBox" class="muted">Chon mot bai de xem timeline.</div></div><div class="card"><h2 style="margin-top:0">Ket qua API</h2><pre id="resultBox">Chua co thao tac.</pre></div></section>
   </main>
@@ -811,13 +893,14 @@ app.get("/admin/timelines", (req, res) => {
     function escapeText(value){ return String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;"); }
     function formatDate(seconds){ if(!seconds)return "-"; return new Date(seconds*1000).toLocaleString(); }
     function formatTime(seconds){ seconds=Math.max(0,Math.floor(Number(seconds)||0)); const m=Math.floor(seconds/60); const s=seconds%60; return m+":"+String(s).padStart(2,"0"); }
+    function renderAggregateMarkers(markers){ markers=Array.isArray(markers)?markers:[]; if(!markers.length) return '<span class="muted">Chua co ket qua tong hop</span>'; return '<div class="summary-lines">'+markers.slice(0,4).map(marker=>{ const percent=Math.round(Math.max(0,Math.min(1,Number(marker.confidence)||0))*100); const label=marker.markerType==="initial_key"?"Dau bai":"Len tone"; return '<div class="summary-line"><span class="pill">'+escapeText(label)+'</span><span class="summary-key">'+escapeText(marker.key)+' '+escapeText(marker.scale)+'</span><span class="summary-meta">'+percent+'%</span><span class="muted">@ '+escapeText(formatTime((marker.timeMs||0)/1000))+'</span><span class="muted">support '+escapeText(marker.supportCount||0)+'</span></div>'; }).join("")+'</div>'; }
     async function api(path, body){ const res=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); const text=await res.text(); let data; try{data=JSON.parse(text)}catch{data={ok:false,message:text}} if(!res.ok) throw data; return data; }
     async function loadSongs(){ try{ const q=encodeURIComponent($("searchBox").value.trim()); const res=await fetch("/api/admin/timeline-songs?adminToken="+encodeURIComponent(getToken())+"&q="+q); const data=await res.json(); if(!res.ok) throw data; songs=data.songs||[]; showResult(data); renderSongs(); }catch(e){ showResult(e); } }
     async function showSong(songId){ try{ const res=await fetch("/api/admin/timeline-songs/"+encodeURIComponent(songId)+"?adminToken="+encodeURIComponent(getToken())); const data=await res.json(); if(!res.ok) throw data; selectedSong=data.song; showResult(data); renderDetail(data.song); }catch(e){ showResult(e); } }
     async function deleteTimeline(timelineId){ if(!confirm("Xoa timeline #"+timelineId+"?")) return; try{ const data=await api("/api/admin/delete-timeline",{adminToken:getToken(),timelineId}); showResult(data); if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
     async function deleteSong(songId){ const song=songs.find(item=>item.songId===String(songId)); if(!confirm("Xoa ca bai nay va tat ca timeline?\\n\\n"+(song?.title||song?.youtubeVideoId||songId))) return; try{ const data=await api("/api/admin/delete-timeline-song",{adminToken:getToken(),songId}); showResult(data); selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; await loadSongs(); }catch(e){ showResult(e); } }
-    function renderSongs(){ $("songCount").textContent=songs.length+" bai"; $("summaryText").textContent="Dang hien thi "+songs.length+" bai."; $("songRows").innerHTML=songs.map(song=>{ const title=song.title||"(chua co ten)"; const youtubeUrl="https://www.youtube.com/watch?v="+encodeURIComponent(song.youtubeVideoId); return '<tr><td><b>'+escapeText(song.youtubeVideoId)+'</b><div><a href="'+youtubeUrl+'" target="_blank">Mo YouTube</a></div></td><td>'+escapeText(title)+'<div class="muted">'+escapeText(song.artist||"")+'</div></td><td>'+escapeText(formatTime(song.durationSeconds))+'</td><td><span class="pill">'+escapeText(song.timelineCount)+'</span></td><td>'+escapeText(song.markerCount)+'</td><td>'+escapeText(song.useCount)+'</td><td>'+escapeText(formatDate(song.lastTimelineAt||song.updatedAt))+'</td><td class="actions"><button class="secondary" onclick="showSong(\\''+escapeText(song.songId)+'\\')">Chi tiet</button><button class="danger" onclick="deleteSong(\\''+escapeText(song.songId)+'\\')">Xoa bai</button></td></tr>'; }).join(""); }
-    function renderDetail(song){ const timelines=song.timelines||[]; $("detailBox").innerHTML='<div><b>'+escapeText(song.title||song.youtubeVideoId)+'</b></div><div class="muted">YouTube ID: '+escapeText(song.youtubeVideoId)+' | '+escapeText(formatTime(song.durationSeconds))+'</div><div style="margin-top:12px">'+timelines.map(timeline=>{ const markers=timeline.markers||[]; return '<div style="border:1px solid #2a2f3a;border-radius:12px;padding:12px;margin-bottom:12px"><div class="row"><div><b>Timeline #'+escapeText(timeline.timelineId)+'</b><div class="muted">source: '+escapeText(timeline.source||"-")+' | machine: '+escapeText(timeline.createdByMachineId||"-")+'</div></div><div><span class="pill">up '+escapeText(timeline.voteUp)+'</span> <span class="pill">down '+escapeText(timeline.voteDown)+'</span> <span class="pill">use '+escapeText(timeline.useCount)+'</span></div><div style="flex:0 0 auto"><button class="danger" onclick="deleteTimeline(\\''+escapeText(timeline.timelineId)+'\\')">Xoa timeline</button></div></div><div class="muted" style="margin:8px 0">updated: '+escapeText(formatDate(timeline.updatedAt))+'</div><table style="min-width:0"><thead><tr><th>Time</th><th>Key</th><th>Scale</th><th>Type</th><th>Confidence</th></tr></thead><tbody>'+markers.map(marker=>'<tr><td>'+escapeText(formatTime(marker.timeMs/1000))+'</td><td>'+escapeText(marker.key)+'</td><td>'+escapeText(marker.scale)+'</td><td>'+escapeText(marker.markerType)+'</td><td>'+escapeText(marker.confidence)+'</td></tr>').join("")+'</tbody></table></div>'; }).join("")+'</div>'; }
+    function renderSongs(){ $("songCount").textContent=songs.length+" bai"; $("summaryText").textContent="Dang hien thi "+songs.length+" bai."; $("songRows").innerHTML=songs.map(song=>{ const title=song.title||"(chua co ten)"; const youtubeUrl="https://www.youtube.com/watch?v="+encodeURIComponent(song.youtubeVideoId); return '<tr><td><b>'+escapeText(song.youtubeVideoId)+'</b><div><a href="'+youtubeUrl+'" target="_blank">Mo YouTube</a></div></td><td>'+escapeText(title)+'<div class="muted">'+escapeText(song.artist||"")+'</div></td><td>'+escapeText(formatTime(song.durationSeconds))+'</td><td>'+renderAggregateMarkers(song.aggregateMarkers)+'</td><td>'+escapeText(formatDate(song.lastTimelineAt||song.updatedAt))+'</td><td class="actions"><button class="secondary" onclick="showSong(\\''+escapeText(song.songId)+'\\')">Chi tiet</button><button class="danger" onclick="deleteSong(\\''+escapeText(song.songId)+'\\')">Xoa bai</button></td></tr>'; }).join(""); }
+    function renderDetail(song){ const timelines=song.timelines||[]; const stats='<div class="stat-grid"><div class="stat"><span class="muted">Timeline</span><b>'+escapeText(song.timelineCount||0)+'</b></div><div class="stat"><span class="muted">Moc</span><b>'+escapeText(song.markerCount||0)+'</b></div><div class="stat"><span class="muted">Luot dung</span><b>'+escapeText(song.useCount||0)+'</b></div></div>'; const aggregate='<div style="border:1px solid #2a2f3a;border-radius:12px;padding:12px;margin:12px 0"><div style="font-weight:750;margin-bottom:8px">Ket qua tong hop</div>'+renderAggregateMarkers(song.aggregateMarkers)+'</div>'; $("detailBox").innerHTML='<div><b>'+escapeText(song.title||song.youtubeVideoId)+'</b></div><div class="muted">YouTube ID: '+escapeText(song.youtubeVideoId)+' | '+escapeText(formatTime(song.durationSeconds))+'</div>'+stats+aggregate+'<div style="margin-top:12px">'+timelines.map(timeline=>{ const markers=timeline.markers||[]; return '<div style="border:1px solid #2a2f3a;border-radius:12px;padding:12px;margin-bottom:12px"><div class="row"><div><b>Timeline #'+escapeText(timeline.timelineId)+'</b><div class="muted">source: '+escapeText(timeline.source||"-")+' | machine: '+escapeText(timeline.createdByMachineId||"-")+'</div></div><div><span class="pill">up '+escapeText(timeline.voteUp)+'</span> <span class="pill">down '+escapeText(timeline.voteDown)+'</span> <span class="pill">use '+escapeText(timeline.useCount)+'</span></div><div style="flex:0 0 auto"><button class="danger" onclick="deleteTimeline(\\''+escapeText(timeline.timelineId)+'\\')">Xoa timeline</button></div></div><div class="muted" style="margin:8px 0">updated: '+escapeText(formatDate(timeline.updatedAt))+'</div><table style="min-width:0"><thead><tr><th>Time</th><th>Key</th><th>Scale</th><th>Type</th><th>Confidence</th></tr></thead><tbody>'+markers.map(marker=>'<tr><td>'+escapeText(formatTime(marker.timeMs/1000))+'</td><td>'+escapeText(marker.key)+'</td><td>'+escapeText(marker.scale)+'</td><td>'+escapeText(marker.markerType)+'</td><td>'+escapeText(marker.confidence)+'</td></tr>').join("")+'</tbody></table></div>'; }).join("")+'</div>'; }
     restoreToken(); $("saveTokenBtn").addEventListener("click", saveToken); $("loadBtn").addEventListener("click", loadSongs); $("searchBox").addEventListener("keydown", event => { if(event.key === "Enter") loadSongs(); }); loadSongs();
   </script>
 </body>
