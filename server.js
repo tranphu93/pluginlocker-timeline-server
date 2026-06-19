@@ -39,7 +39,7 @@ console.log("Database URL info:", getDatabaseUrlInfo());
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 1,
+  max: 5,
   idleTimeoutMillis: 10000,
   connectionTimeoutMillis: 30000
 });
@@ -377,7 +377,33 @@ async function listTimelineSongs(searchText = "") {
   }
 
   const result = await pool.query(
-    `select
+    `with filtered_songs as (
+       select s.*
+       from songs s
+       ${whereSql}
+     ),
+     timeline_stats as (
+       select
+         song_id,
+         count(*)::int as timeline_count,
+         coalesce(sum(vote_up), 0)::int as vote_up,
+         coalesce(sum(vote_down), 0)::int as vote_down,
+         coalesce(sum(use_count), 0)::int as use_count,
+         max(updated_at) as last_timeline_at
+       from song_timelines
+       where song_id in (select id from filtered_songs)
+       group by song_id
+     ),
+     marker_stats as (
+       select
+         t.song_id,
+         count(m.id)::int as marker_count
+       from song_timelines t
+       left join timeline_markers m on m.timeline_id = t.id
+       where t.song_id in (select id from filtered_songs)
+       group by t.song_id
+     )
+     select
        s.id,
        s.youtube_video_id,
        s.title,
@@ -385,18 +411,16 @@ async function listTimelineSongs(searchText = "") {
        s.duration_seconds,
        s.created_at,
        s.updated_at,
-       count(distinct t.id)::int as timeline_count,
-       count(m.id)::int as marker_count,
-       coalesce(sum(t.vote_up), 0)::int as vote_up,
-       coalesce(sum(t.vote_down), 0)::int as vote_down,
-       coalesce(sum(t.use_count), 0)::int as use_count,
-       max(t.updated_at) as last_timeline_at
-     from songs s
-     left join song_timelines t on t.song_id = s.id
-     left join timeline_markers m on m.timeline_id = t.id
-     ${whereSql}
-     group by s.id
-     order by coalesce(max(t.updated_at), s.updated_at) desc
+       coalesce(ts.timeline_count, 0)::int as timeline_count,
+       coalesce(ms.marker_count, 0)::int as marker_count,
+       coalesce(ts.vote_up, 0)::int as vote_up,
+       coalesce(ts.vote_down, 0)::int as vote_down,
+       coalesce(ts.use_count, 0)::int as use_count,
+       ts.last_timeline_at
+     from filtered_songs s
+     left join timeline_stats ts on ts.song_id = s.id
+     left join marker_stats ms on ms.song_id = s.id
+     order by coalesce(ts.last_timeline_at, s.updated_at) desc
      limit 300`,
     values
   );
@@ -598,6 +622,9 @@ app.post("/api/song-timelines", async (req, res) => {
     }
 
     await client.query("commit");
+    client.release();
+    client = null;
+
     const communityTimeline = await loadCommunityTimeline(youtubeVideoId);
     return res.json({
       ok: true,
