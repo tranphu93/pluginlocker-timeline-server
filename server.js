@@ -1,4 +1,4 @@
-﻿const express = require("express");
+const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 
@@ -80,38 +80,17 @@ function normalizeYouTubeVideoId(value) {
   return "";
 }
 
-function normalizeTimelineKey(value, scale = "") {
+function normalizeTimelineKey(value) {
   const key = String(value || "").trim();
-  if (!key) return "";
-
-  const token = key
-    .replace("\u266f", "#")
-    .replace("\u266d", "b")
-    .replace(/([A-Ga-g])b$/, (_, root) => `${root.toUpperCase()}B`)
-    .replace(/([A-Ga-g])#$/, (_, root) => `${root.toUpperCase()}#`)
-    .toUpperCase();
-
-  const normalized = {
-    "C": "C",
-    "C#": "C#",
-    "DB": "C#",
-    "D": "D",
-    "D#": "Eb",
-    "EB": "Eb",
-    "E": "E",
-    "F": "F",
-    "F#": "F#",
-    "GB": "F#",
-    "G": "G",
-    "G#": "G#",
-    "AB": "G#",
-    "A": "A",
-    "A#": "Bb",
-    "BB": "Bb",
-    "B": "B"
-  }[token] || key;
-
-  return String(scale).trim() === "Major" ? ({ "C#": "Db", "G#": "Ab" }[normalized] || normalized) : normalized;
+  const aliases = {
+    "C#": "DB",
+    "D#": "EB",
+    "F#": "GB",
+    "G#": "AB",
+    "A#": "BB"
+  };
+  const normalized = key.replace("\u266f", "#").replace("\u266d", "B").toUpperCase();
+  return aliases[normalized] || normalized;
 }
 
 function normalizeScale(value) {
@@ -136,8 +115,8 @@ function parseTimelineMarkers(markers) {
   return markers
     .map((marker, index) => ({
       timeMs: Math.max(0, Math.floor(Number(marker.timeMs || marker.time_ms || 0))),
+      key: normalizeTimelineKey(marker.key),
       scale: normalizeScale(marker.scale),
-      key: normalizeTimelineKey(marker.key, normalizeScale(marker.scale)),
       markerType: normalizeMarkerType(marker.markerType || marker.marker_type, index),
       confidence: Math.max(0, Math.min(1, Number(marker.confidence ?? 1)))
     }))
@@ -172,8 +151,8 @@ function aggregateTimelineMarkers(rows, timelineCount) {
   for (const row of rows) {
     const marker = {
       timeMs: Number(row.time_ms || 0),
+      key: normalizeTimelineKey(row.key),
       scale: normalizeScale(row.scale),
-      key: normalizeTimelineKey(row.key, normalizeScale(row.scale)),
       markerType: row.marker_type || "modulation",
       confidence: Math.max(0, Math.min(1, Number(row.confidence ?? 1)))
     };
@@ -574,8 +553,8 @@ async function getTimelineSongDetail(songId) {
     markersByTimeline.get(key).push({
       markerId: String(marker.id),
       timeMs: Number(marker.time_ms || 0),
-      key: normalizeTimelineKey(marker.key, normalizeScale(marker.scale)),
-      scale: normalizeScale(marker.scale),
+      key: marker.key || "",
+      scale: marker.scale || "",
       markerType: marker.marker_type || "",
       confidence: Number(marker.confidence || 0)
     });
@@ -628,6 +607,209 @@ async function deleteTimelineSong(songId) {
 
   const result = await pool.query("delete from songs where id = $1 returning id", [normalizedSongId]);
   return result.rows.length > 0;
+}
+
+const TIMELINE_BACKUP_COLUMNS = [
+  "format_version", "record_type", "song_backup_id", "youtube_video_id", "song_title", "artist",
+  "duration_seconds", "song_created_at", "song_updated_at", "timeline_backup_id",
+  "created_by_machine_id", "source", "vote_up", "vote_down", "use_count",
+  "timeline_created_at", "timeline_updated_at", "marker_backup_id", "time_ms", "key", "scale",
+  "marker_type", "confidence", "vote_backup_id", "machine_id", "vote", "vote_created_at"
+];
+
+function escapeCsvValue(value) {
+  const text = String(value ?? "");
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+function serializeCsv(rows) {
+  const lines = [TIMELINE_BACKUP_COLUMNS.map(escapeCsvValue).join(",")];
+  for (const row of rows) {
+    lines.push(TIMELINE_BACKUP_COLUMNS.map(column => escapeCsvValue(row[column])).join(","));
+  }
+  return "\uFEFF" + lines.join("\r\n");
+}
+
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let quoted = false;
+  const source = String(text || "").replace(/^\uFEFF/, "");
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quoted) {
+      if (character === '"' && source[index + 1] === '"') {
+        field += '"';
+        index += 1;
+      } else if (character === '"') {
+        quoted = false;
+      } else {
+        field += character;
+      }
+    } else if (character === '"') {
+      quoted = true;
+    } else if (character === ",") {
+      row.push(field);
+      field = "";
+    } else if (character === "\n") {
+      row.push(field.replace(/\r$/, ""));
+      if (row.some(value => value !== "")) rows.push(row);
+      row = [];
+      field = "";
+    } else {
+      field += character;
+    }
+  }
+
+  if (quoted) throw new Error("CSV co o du lieu chua dong dau ngoac kep.");
+  row.push(field.replace(/\r$/, ""));
+  if (row.some(value => value !== "")) rows.push(row);
+  return rows;
+}
+
+function csvRowsToObjects(text) {
+  const rows = parseCsv(text);
+  if (rows.length < 2) throw new Error("CSV khong co du lieu backup.");
+  const headers = rows[0].map(value => value.trim());
+  for (const required of ["format_version", "record_type", "song_backup_id", "youtube_video_id"]) {
+    if (!headers.includes(required)) throw new Error(`CSV thieu cot bat buoc: ${required}`);
+  }
+  if (rows.length > 100001) throw new Error("CSV vuot qua gioi han 100000 dong du lieu.");
+  return rows.slice(1).map(values => Object.fromEntries(headers.map((header, index) => [header, values[index] || ""])));
+}
+
+function backupNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+async function buildTimelineBackupCsv() {
+  const [songResult, timelineResult, markerResult, voteResult] = await Promise.all([
+    pool.query("select * from songs order by id asc"),
+    pool.query("select * from song_timelines order by id asc"),
+    pool.query("select * from timeline_markers order by id asc"),
+    pool.query("select * from timeline_votes order by id asc")
+  ]);
+  const rows = [];
+  for (const song of songResult.rows) {
+    rows.push({
+      format_version: "1", record_type: "song", song_backup_id: song.id,
+      youtube_video_id: song.youtube_video_id, song_title: song.title, artist: song.artist,
+      duration_seconds: song.duration_seconds, song_created_at: song.created_at, song_updated_at: song.updated_at
+    });
+  }
+  for (const timeline of timelineResult.rows) {
+    rows.push({
+      format_version: "1", record_type: "timeline", song_backup_id: timeline.song_id,
+      timeline_backup_id: timeline.id, created_by_machine_id: timeline.created_by_machine_id,
+      source: timeline.source, vote_up: timeline.vote_up, vote_down: timeline.vote_down,
+      use_count: timeline.use_count, timeline_created_at: timeline.created_at,
+      timeline_updated_at: timeline.updated_at
+    });
+  }
+  for (const marker of markerResult.rows) {
+    rows.push({
+      format_version: "1", record_type: "marker", timeline_backup_id: marker.timeline_id,
+      marker_backup_id: marker.id, time_ms: marker.time_ms, key: marker.key, scale: marker.scale,
+      marker_type: marker.marker_type, confidence: marker.confidence
+    });
+  }
+  for (const vote of voteResult.rows) {
+    rows.push({
+      format_version: "1", record_type: "vote", timeline_backup_id: vote.timeline_id,
+      vote_backup_id: vote.id, machine_id: vote.machine_id, vote: vote.vote, vote_created_at: vote.created_at
+    });
+  }
+  return serializeCsv(rows);
+}
+
+async function importTimelineBackupCsv(csvText) {
+  const rows = csvRowsToObjects(csvText);
+  if (rows.some(row => row.format_version !== "1")) throw new Error("CSV co phien ban backup khong duoc ho tro.");
+  const validTypes = new Set(["song", "timeline", "marker", "vote"]);
+  if (rows.some(row => !validTypes.has(row.record_type))) throw new Error("CSV co record_type khong hop le.");
+
+  const songRows = rows.filter(row => row.record_type === "song");
+  const timelineRows = rows.filter(row => row.record_type === "timeline");
+  const markerRows = rows.filter(row => row.record_type === "marker");
+  const voteRows = rows.filter(row => row.record_type === "vote");
+  if (songRows.length === 0) throw new Error("CSV khong co dong song nao.");
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const songIdMap = new Map();
+    for (const row of songRows) {
+      const videoId = normalizeYouTubeVideoId(row.youtube_video_id);
+      if (!videoId || !row.song_backup_id) throw new Error("Dong song thieu YouTube ID hoac song_backup_id.");
+      const createdAt = Math.max(0, Math.floor(backupNumber(row.song_created_at, nowSeconds())));
+      const updatedAt = Math.max(createdAt, Math.floor(backupNumber(row.song_updated_at, createdAt)));
+      const result = await client.query(
+        `insert into songs (youtube_video_id, title, artist, duration_seconds, created_at, updated_at)
+         values ($1,$2,$3,$4,$5,$6)
+         on conflict (youtube_video_id) do update set
+           title=excluded.title, artist=excluded.artist, duration_seconds=excluded.duration_seconds,
+           created_at=excluded.created_at, updated_at=excluded.updated_at
+         returning id`,
+        [videoId, String(row.song_title || "").slice(0, 300), String(row.artist || "").slice(0, 200),
+          Math.max(0, Math.floor(backupNumber(row.duration_seconds))), createdAt, updatedAt]
+      );
+      const songId = result.rows[0].id;
+      songIdMap.set(String(row.song_backup_id), songId);
+      await client.query("delete from song_timelines where song_id = $1", [songId]);
+    }
+
+    const timelineIdMap = new Map();
+    for (const row of timelineRows) {
+      const songId = songIdMap.get(String(row.song_backup_id));
+      if (!songId || !row.timeline_backup_id) throw new Error("Timeline tham chieu song khong ton tai trong CSV.");
+      const createdAt = Math.max(0, Math.floor(backupNumber(row.timeline_created_at, nowSeconds())));
+      const updatedAt = Math.max(createdAt, Math.floor(backupNumber(row.timeline_updated_at, createdAt)));
+      const result = await client.query(
+        `insert into song_timelines
+           (song_id, created_by_machine_id, source, vote_up, vote_down, use_count, created_at, updated_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8) returning id`,
+        [songId, String(row.created_by_machine_id || "").slice(0, 200), String(row.source || "community").slice(0, 80),
+          Math.max(0, Math.floor(backupNumber(row.vote_up))), Math.max(0, Math.floor(backupNumber(row.vote_down))),
+          Math.max(0, Math.floor(backupNumber(row.use_count))), createdAt, updatedAt]
+      );
+      timelineIdMap.set(String(row.timeline_backup_id), result.rows[0].id);
+    }
+
+    for (const row of markerRows) {
+      const timelineId = timelineIdMap.get(String(row.timeline_backup_id));
+      if (!timelineId) throw new Error("Marker tham chieu timeline khong ton tai trong CSV.");
+      await client.query(
+        `insert into timeline_markers (timeline_id, time_ms, key, scale, marker_type, confidence)
+         values ($1,$2,$3,$4,$5,$6)`,
+        [timelineId, Math.max(0, Math.floor(backupNumber(row.time_ms))), normalizeTimelineKey(row.key),
+          normalizeScale(row.scale), normalizeMarkerType(row.marker_type, 0),
+          Math.max(0, Math.min(1, backupNumber(row.confidence, 1)))]
+      );
+    }
+
+    for (const row of voteRows) {
+      const timelineId = timelineIdMap.get(String(row.timeline_backup_id));
+      const vote = Math.sign(Math.floor(backupNumber(row.vote)));
+      if (!timelineId || !row.machine_id || ![-1, 1].includes(vote)) throw new Error("Dong vote trong CSV khong hop le.");
+      await client.query(
+        `insert into timeline_votes (timeline_id, machine_id, vote, created_at)
+         values ($1,$2,$3,$4)
+         on conflict (timeline_id, machine_id) do update set vote=excluded.vote, created_at=excluded.created_at`,
+        [timelineId, String(row.machine_id).slice(0, 200), vote,
+          Math.max(0, Math.floor(backupNumber(row.vote_created_at, nowSeconds())))]
+      );
+    }
+    await client.query("commit");
+    return { songs: songRows.length, timelines: timelineRows.length, markers: markerRows.length, votes: voteRows.length };
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 app.get("/", (req, res) => {
@@ -853,6 +1035,37 @@ app.post("/api/admin/delete-timeline-song", async (req, res) => {
   }
 });
 
+app.get("/api/admin/timeline-backup/export.csv", async (req, res) => {
+  try {
+    if (!checkTimelineAdminToken(req, res)) return;
+    const csv = await buildTimelineBackupCsv();
+    const date = new Date().toISOString().slice(0, 10);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="pluginlocker-timeline-backup-${date}.csv"`);
+    return res.send(csv);
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: "CSV export failed: " + error.message });
+  }
+});
+
+app.post(
+  "/api/admin/timeline-backup/import",
+  express.text({ type: ["text/csv", "text/plain", "application/csv", "application/octet-stream"], limit: "25mb" }),
+  async (req, res) => {
+    try {
+      if (!checkTimelineAdminToken(req, res)) return;
+      const result = await importTimelineBackupCsv(req.body);
+      return res.json({
+        ok: true,
+        message: "CSV import thanh cong. Timeline cua cac bai trong file da duoc khoi phuc.",
+        imported: result
+      });
+    } catch (error) {
+      return res.status(400).json({ ok: false, message: "CSV import failed: " + error.message });
+    }
+  }
+);
+
 app.get("/admin/timelines", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
@@ -901,6 +1114,15 @@ app.get("/admin/timelines", (req, res) => {
       <div style="flex:0 0 auto; align-self:end"><button id="loadBtn" type="button">Tai danh sach</button></div>
       <div style="flex:0 0 auto; align-self:end"><button id="saveTokenBtn" class="secondary" type="button">Luu token</button></div>
     </div><div id="summaryText" class="muted" style="margin-top:12px">Chua tai du lieu.</div></section>
+    <section class="card">
+      <div class="toolbar"><div><h2 style="margin:0 0 4px">Sao luu / chuyen server</h2><div class="muted">Xuat CSV de backup. Khi nhap, timeline cua cac bai co trong file se duoc khoi phuc va thay the du lieu cu cua chinh cac bai do.</div></div></div>
+      <div class="row">
+        <div style="flex:0 0 auto;min-width:0"><button id="exportCsvBtn" type="button">Xuat file CSV</button></div>
+        <div><input id="importCsvFile" type="file" accept=".csv,text/csv" /></div>
+        <div style="flex:0 0 auto;min-width:0"><button id="importCsvBtn" class="secondary" type="button">Nhap file CSV</button></div>
+      </div>
+      <div id="backupStatus" class="muted" style="margin-top:10px">Chua co thao tac backup.</div>
+    </section>
     <section class="card"><div class="toolbar"><h2 style="margin:0">Bai da upload</h2><span class="pill" id="songCount">0 bai</span></div>
       <div class="song-table-wrap"><table><thead><tr><th style="width:220px">YouTube</th><th style="width:260px">Ten bai</th><th style="width:110px">Thoi luong</th><th>Ket qua tong hop</th><th style="width:180px">Cap nhat</th><th style="width:220px">Thao tac</th></tr></thead><tbody id="songRows"></tbody></table></div>
     </section>
@@ -924,7 +1146,9 @@ app.get("/admin/timelines", (req, res) => {
     async function deleteSong(songId){ const song=songs.find(item=>item.songId===String(songId)); if(!confirm("Xoa ca bai nay va tat ca timeline?\\n\\n"+(song?.title||song?.youtubeVideoId||songId))) return; try{ const data=await api("/api/admin/delete-timeline-song",{adminToken:getToken(),songId}); showResult(data); selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; await loadSongs(); }catch(e){ showResult(e); } }
     function renderSongs(){ $("songCount").textContent=songs.length+" bai"; $("summaryText").textContent="Dang hien thi "+songs.length+" bai."; $("songRows").innerHTML=songs.map(song=>{ const title=song.title||"(chua co ten)"; const youtubeUrl="https://www.youtube.com/watch?v="+encodeURIComponent(song.youtubeVideoId); return '<tr><td><b>'+escapeText(song.youtubeVideoId)+'</b><div><a href="'+youtubeUrl+'" target="_blank">Mo YouTube</a></div></td><td>'+escapeText(title)+'<div class="muted">'+escapeText(song.artist||"")+'</div></td><td>'+escapeText(formatTime(song.durationSeconds))+'</td><td>'+renderAggregateMarkers(song.aggregateMarkers,true)+'</td><td>'+escapeText(formatDate(song.lastTimelineAt||song.updatedAt))+'</td><td class="actions"><button class="secondary" onclick="showSong(\\''+escapeText(song.songId)+'\\')">Chi tiet</button><button class="danger" onclick="deleteSong(\\''+escapeText(song.songId)+'\\')">Xoa bai</button></td></tr>'; }).join(""); }
     function renderDetail(song){ const timelines=song.timelines||[]; const stats='<div class="stat-grid"><div class="stat"><span class="muted">Timeline</span><b>'+escapeText(song.timelineCount||0)+'</b></div><div class="stat"><span class="muted">Moc</span><b>'+escapeText(song.markerCount||0)+'</b></div><div class="stat"><span class="muted">Luot dung</span><b>'+escapeText(song.useCount||0)+'</b></div></div>'; const aggregate='<div style="border:1px solid #2a2f3a;border-radius:12px;padding:12px;margin:12px 0"><div style="font-weight:750;margin-bottom:8px">Ket qua tong hop</div>'+renderAggregateMarkers(song.aggregateMarkers)+'</div>'; $("detailBox").innerHTML='<div><b>'+escapeText(song.title||song.youtubeVideoId)+'</b></div><div class="muted">YouTube ID: '+escapeText(song.youtubeVideoId)+' | '+escapeText(formatTime(song.durationSeconds))+'</div>'+stats+aggregate+'<div style="margin-top:12px">'+timelines.map(timeline=>{ const markers=timeline.markers||[]; return '<div style="border:1px solid #2a2f3a;border-radius:12px;padding:12px;margin-bottom:12px"><div class="row"><div><b>Timeline #'+escapeText(timeline.timelineId)+'</b><div class="muted">source: '+escapeText(timeline.source||"-")+' | machine: '+escapeText(timeline.createdByMachineId||"-")+'</div></div><div><span class="pill">up '+escapeText(timeline.voteUp)+'</span> <span class="pill">down '+escapeText(timeline.voteDown)+'</span> <span class="pill">use '+escapeText(timeline.useCount)+'</span></div><div style="flex:0 0 auto"><button class="danger" onclick="deleteTimeline(\\''+escapeText(timeline.timelineId)+'\\')">Xoa timeline</button></div></div><div class="muted" style="margin:8px 0">updated: '+escapeText(formatDate(timeline.updatedAt))+'</div><table style="min-width:0"><thead><tr><th>Time</th><th>Key</th><th>Scale</th><th>Type</th><th>Confidence</th></tr></thead><tbody>'+markers.map(marker=>'<tr><td>'+escapeText(formatTime(marker.timeMs/1000))+'</td><td>'+escapeText(marker.key)+'</td><td>'+escapeText(marker.scale)+'</td><td>'+escapeText(marker.markerType)+'</td><td>'+escapeText(marker.confidence)+'</td></tr>').join("")+'</tbody></table></div>'; }).join("")+'</div>'; }
-    restoreToken(); $("saveTokenBtn").addEventListener("click", saveToken); $("loadBtn").addEventListener("click", loadSongs); $("searchBox").addEventListener("keydown", event => { if(event.key === "Enter") loadSongs(); }); loadSongs();
+    async function exportCsv(){ try{ $("backupStatus").textContent="Dang tao file CSV..."; const res=await fetch("/api/admin/timeline-backup/export.csv?adminToken="+encodeURIComponent(getToken())); if(!res.ok){ const error=await res.json(); throw error; } const blob=await res.blob(); const url=URL.createObjectURL(blob); const link=document.createElement("a"); link.href=url; link.download="pluginlocker-timeline-backup-"+new Date().toISOString().slice(0,10)+".csv"; document.body.appendChild(link); link.click(); link.remove(); setTimeout(()=>URL.revokeObjectURL(url),1000); $("backupStatus").textContent="Da xuat file CSV thanh cong."; }catch(e){ $("backupStatus").textContent=e.message||"Xuat CSV that bai."; showResult(e); } }
+    async function importCsv(){ const file=$("importCsvFile").files[0]; if(!file){ $("backupStatus").textContent="Hay chon file CSV can nhap."; return; } if(!confirm("Nhap backup nay? Timeline hien tai cua cac bai co trong file se bi thay the.")) return; try{ $("backupStatus").textContent="Dang nhap va khoi phuc CSV..."; const csv=await file.text(); const res=await fetch("/api/admin/timeline-backup/import?adminToken="+encodeURIComponent(getToken()),{method:"POST",headers:{"Content-Type":"text/csv; charset=utf-8"},body:csv}); const data=await res.json(); if(!res.ok) throw data; $("backupStatus").textContent="Nhap thanh cong: "+data.imported.songs+" bai, "+data.imported.timelines+" timeline, "+data.imported.markers+" moc."; showResult(data); selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; await loadSongs(); }catch(e){ $("backupStatus").textContent=e.message||"Nhap CSV that bai."; showResult(e); } }
+    restoreToken(); $("saveTokenBtn").addEventListener("click", saveToken); $("loadBtn").addEventListener("click", loadSongs); $("exportCsvBtn").addEventListener("click", exportCsv); $("importCsvBtn").addEventListener("click", importCsv); $("searchBox").addEventListener("keydown", event => { if(event.key === "Enter") loadSongs(); }); loadSongs();
   </script>
 </body>
 </html>`);
@@ -945,4 +1169,3 @@ ensureSchema()
       console.log(`PluginLocker timeline server running on port ${PORT}`);
     });
   });
-
