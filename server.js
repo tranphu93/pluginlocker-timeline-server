@@ -83,11 +83,11 @@ function normalizeYouTubeVideoId(value) {
 function normalizeTimelineKey(value) {
   const key = String(value || "").trim();
   const aliases = {
-    "C#": "DB",
-    "D#": "EB",
-    "F#": "GB",
-    "G#": "AB",
-    "A#": "BB"
+    "C#": "C#",
+    "D#": "D#",
+    "F#": "F#",
+    "G#": "G#",
+    "A#": "A#"
   };
   const normalized = key.replace("\u266f", "#").replace("\u266d", "B").toUpperCase();
   return aliases[normalized] || normalized;
