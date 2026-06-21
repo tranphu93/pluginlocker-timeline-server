@@ -166,26 +166,54 @@ function aggregateTimelineMarkers(rows, timelineCount) {
       item.key === marker.key &&
       item.scale === marker.scale &&
       item.markerType === marker.markerType &&
-      Math.abs(item.timeMs - marker.timeMs) <= TIMELINE_MATCH_TOLERANCE_MS
+      Math.abs(item.anchorTimeMs - marker.timeMs) <= TIMELINE_MATCH_TOLERANCE_MS
     );
 
     if (!cluster) {
       cluster = {
+        anchorTimeMs: marker.timeMs,
         timeMs: marker.timeMs,
         key: marker.key,
         scale: marker.scale,
         markerType: marker.markerType,
-        weightedTime: 0,
         score: 0,
-        supportCount: 0
+        supportCount: 0,
+        timeCandidates: []
       };
       clusters.push(cluster);
     }
 
-    cluster.weightedTime += marker.timeMs * weight;
-    cluster.score += weight;
-    cluster.supportCount++;
-    cluster.timeMs = Math.round(cluster.weightedTime / cluster.score);
+    let candidate = cluster.timeCandidates.find(item =>
+      Math.abs(item.anchorTimeMs - marker.timeMs) <= 1000
+    );
+    if (!candidate) {
+      candidate = {
+        anchorTimeMs: marker.timeMs,
+        selectedTimeMs: marker.timeMs,
+        selectedWeight: weight,
+        score: 0,
+        supportCount: 0
+      };
+      cluster.timeCandidates.push(candidate);
+    }
+
+    candidate.score += weight;
+    candidate.supportCount++;
+    if (weight > candidate.selectedWeight) {
+      candidate.selectedWeight = weight;
+      candidate.selectedTimeMs = marker.timeMs;
+    }
+
+    const winner = cluster.timeCandidates
+      .slice()
+      .sort((left, right) =>
+        right.supportCount - left.supportCount ||
+        right.score - left.score ||
+        right.selectedWeight - left.selectedWeight ||
+        left.selectedTimeMs - right.selectedTimeMs)[0];
+    cluster.timeMs = winner.selectedTimeMs;
+    cluster.score = winner.score;
+    cluster.supportCount = winner.supportCount;
   }
 
   return clusters
