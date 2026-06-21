@@ -1066,6 +1066,62 @@ async function importTimelineBackupCsv(csvText) {
   }
 }
 
+app.get("/privacy/youtube-sync", (req, res) => {
+  res.type("html").send(`<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chính sách quyền riêng tư - PluginLocker YouTube Sync</title>
+  <style>
+    body{margin:0;background:#0b0e15;color:#e8edf5;font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}
+    main{max-width:820px;margin:0 auto;padding:48px 24px 72px}
+    h1{font-size:32px;line-height:1.2;margin:0 0 8px}h2{font-size:21px;margin:34px 0 8px}
+    .date{color:#9aa8ba;margin-bottom:34px}p,li{color:#cbd5e1}strong{color:#fff}
+    .card{background:#121722;border:1px solid #263044;border-radius:14px;padding:22px 24px;margin:22px 0}
+    code{color:#72c7ff}a{color:#72c7ff}
+  </style>
+</head>
+<body><main>
+  <h1>Chính sách quyền riêng tư</h1>
+  <div class="date">PluginLocker YouTube Sync · Cập nhật ngày 22/06/2026</div>
+
+  <div class="card"><strong>Tóm tắt:</strong> Extension chỉ đồng bộ thông tin phát YouTube với ứng dụng PluginLockerWin chạy trên cùng máy tính. Extension không bán dữ liệu và không gửi dữ liệu duyệt web trực tiếp tới máy chủ bên ngoài.</div>
+
+  <h2>1. Mục đích duy nhất</h2>
+  <p>PluginLocker YouTube Sync được sử dụng để đồng bộ video YouTube đang phát với ứng dụng PluginLockerWin cài trên cùng thiết bị.</p>
+
+  <h2>2. Dữ liệu được xử lý</h2>
+  <p>Khi người dùng mở YouTube, extension có thể xử lý:</p>
+  <ul>
+    <li>URL YouTube và mã video;</li>
+    <li>tiêu đề video;</li>
+    <li>thời gian phát hiện tại và tổng thời lượng;</li>
+    <li>trạng thái phát, tạm dừng hoặc tua video.</li>
+  </ul>
+
+  <h2>3. Cách sử dụng và truyền dữ liệu</h2>
+  <p>Dữ liệu trên chỉ được dùng để hiển thị tên beat, thời gian và đồng bộ timeline trong PluginLockerWin. Extension truyền dữ liệu qua WebSocket nội bộ tới <code>127.0.0.1:9999</code> hoặc <code>localhost:9999</code> trên cùng máy tính.</p>
+  <p>Extension không trực tiếp gửi dữ liệu này tới máy chủ bên ngoài, không bán, không cho thuê và không sử dụng dữ liệu cho quảng cáo, đánh giá tín dụng hoặc mục đích không liên quan.</p>
+
+  <h2>4. Lưu trữ và chia sẻ</h2>
+  <p>Extension không tạo cơ sở dữ liệu lịch sử duyệt web và không chia sẻ dữ liệu với bên thứ ba. Trạng thái gần nhất có thể được giữ tạm thời trong bộ nhớ của extension để hiển thị tình trạng kết nối và sẽ mất khi tiến trình extension kết thúc.</p>
+
+  <h2>5. Quyền của trình duyệt</h2>
+  <ul>
+    <li><strong>tabs:</strong> xác định đúng tab YouTube đang phát khi có nhiều tab.</li>
+    <li><strong>scripting:</strong> đọc trạng thái phần tử video YouTube.</li>
+    <li><strong>youtube.com:</strong> giới hạn hoạt động của extension trên các trang YouTube.</li>
+  </ul>
+
+  <h2>6. Bảo mật và thay đổi chính sách</h2>
+  <p>Extension chỉ chấp nhận kết nối cục bộ với PluginLockerWin. Chính sách này có thể được cập nhật khi chức năng hoặc cách xử lý dữ liệu thay đổi; ngày cập nhật mới nhất luôn được ghi ở đầu trang.</p>
+
+  <h2>7. Liên hệ</h2>
+  <p>Nếu có câu hỏi về quyền riêng tư, người dùng có thể liên hệ nhà phát triển PHU TRAN TPA qua kênh hỗ trợ được cung cấp cùng ứng dụng PluginLockerWin.</p>
+</main></body></html>`);
+});
+
 app.get("/", (req, res) => {
   res.send("PluginLocker timeline server is running.");
 });
