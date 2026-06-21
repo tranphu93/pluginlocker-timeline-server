@@ -154,7 +154,11 @@ function aggregateTimelineMarkers(rows, timelineCount) {
       key: normalizeTimelineKey(row.key),
       scale: normalizeScale(row.scale),
       markerType: row.marker_type || "modulation",
-      confidence: Math.max(0, Math.min(1, Number(row.confidence ?? 1)))
+      confidence: Math.max(0, Math.min(1, Number(row.confidence ?? 1))),
+      machineId: String(row.created_by_machine_id || "").trim(),
+      adminApproved: row.admin_approved === true || String(row.admin_approved).toLowerCase() === "true",
+      confirmationStatus: String(row.confirmation_status || "pending").toLowerCase(),
+      confirmationSupportCount: Math.max(0, Number(row.confirmation_support_count || 0))
     };
 
     const voteUp = Math.max(0, Number(row.vote_up || 0));
@@ -178,6 +182,9 @@ function aggregateTimelineMarkers(rows, timelineCount) {
         markerType: marker.markerType,
         score: 0,
         supportCount: 0,
+        adminApproved: false,
+        confirmationStatus: marker.markerType === "initial_key" ? "verified" : "pending",
+        confirmed: marker.markerType === "initial_key",
         timeCandidates: []
       };
       clusters.push(cluster);
@@ -192,13 +199,31 @@ function aggregateTimelineMarkers(rows, timelineCount) {
         selectedTimeMs: marker.timeMs,
         selectedWeight: weight,
         score: 0,
-        supportCount: 0
+        supportCount: 0,
+        adminApproved: false,
+        confirmationStatus: "pending",
+        confirmationSupportCount: 0,
+        machineWeights: new Map()
       };
       cluster.timeCandidates.push(candidate);
     }
 
-    candidate.score += weight;
-    candidate.supportCount++;
+    candidate.adminApproved = candidate.adminApproved || marker.adminApproved;
+    if (marker.confirmationStatus === "verified") {
+      candidate.confirmationStatus = "verified";
+    } else if (marker.confirmationStatus === "rejected" && candidate.confirmationStatus !== "verified") {
+      candidate.confirmationStatus = "rejected";
+    }
+    candidate.confirmationSupportCount = Math.max(
+      candidate.confirmationSupportCount,
+      marker.confirmationSupportCount);
+    const machineKey = marker.machineId || "unknown-machine";
+    const previousMachineWeight = candidate.machineWeights.get(machineKey) || 0;
+    if (weight > previousMachineWeight) {
+      candidate.machineWeights.set(machineKey, weight);
+      candidate.score += weight - previousMachineWeight;
+    }
+    candidate.supportCount = candidate.machineWeights.size;
     if (weight > candidate.selectedWeight) {
       candidate.selectedWeight = weight;
       candidate.selectedTimeMs = marker.timeMs;
@@ -207,17 +232,26 @@ function aggregateTimelineMarkers(rows, timelineCount) {
     const winner = cluster.timeCandidates
       .slice()
       .sort((left, right) =>
+        Number(right.confirmationStatus === "verified") - Number(left.confirmationStatus === "verified") ||
+        Number(left.confirmationStatus === "rejected") - Number(right.confirmationStatus === "rejected") ||
         right.supportCount - left.supportCount ||
         right.score - left.score ||
         right.selectedWeight - left.selectedWeight ||
         left.selectedTimeMs - right.selectedTimeMs)[0];
     cluster.timeMs = winner.selectedTimeMs;
     cluster.score = winner.score;
-    cluster.supportCount = winner.supportCount;
+    cluster.supportCount = marker.markerType === "initial_key"
+      ? winner.supportCount
+      : winner.confirmationSupportCount;
+    cluster.adminApproved = winner.adminApproved;
+    cluster.confirmationStatus = marker.markerType === "initial_key"
+      ? "verified"
+      : winner.confirmationStatus;
+    cluster.confirmed = cluster.confirmationStatus === "verified";
   }
 
   const aggregateMarkers = clusters
-    .filter(cluster => cluster.score >= 0.25)
+    .filter(cluster => cluster.score >= 0.25 && cluster.confirmed)
     .sort((a, b) => a.timeMs - b.timeMs || b.score - a.score)
     .reduce((markers, cluster) => {
       const previous = markers[markers.length - 1];
@@ -241,7 +275,10 @@ function aggregateTimelineMarkers(rows, timelineCount) {
       scale: cluster.scale,
       markerType: cluster.markerType,
       confidence: clusterConfidence(cluster, timelineCount),
-      supportCount: cluster.supportCount
+      supportCount: cluster.supportCount,
+      adminApproved: cluster.adminApproved,
+      confirmed: cluster.confirmed,
+      confirmationStatus: cluster.confirmationStatus
     }));
 
   const initialMarker = aggregateMarkers
@@ -334,9 +371,106 @@ async function ensureSchema() {
     )
   `);
 
+  await pool.query(
+    "alter table timeline_markers add column if not exists admin_approved boolean not null default false"
+  );
+  await pool.query(
+    "alter table timeline_markers add column if not exists confirmation_status text not null default 'pending'"
+  );
+  await pool.query(
+    "alter table timeline_markers add column if not exists confirmation_support_count integer not null default 0"
+  );
+  await pool.query(`
+    create table if not exists timeline_server_settings (
+      setting_key text primary key,
+      setting_value text not null,
+      updated_at bigint not null
+    )
+  `);
+  const confirmationMigration = await pool.query(
+    `insert into timeline_server_settings (setting_key, setting_value, updated_at)
+     values ('modulation_confirmation_v1_migrated', 'true', $1)
+     on conflict (setting_key) do nothing
+     returning setting_key`,
+    [nowSeconds()]
+  );
+  if (confirmationMigration.rows.length > 0) {
+    await pool.query(
+      `update timeline_markers
+       set confirmation_status = 'verified'
+       where marker_type = 'modulation'`
+    );
+  }
+
   await pool.query("create index if not exists idx_song_timelines_song_id on song_timelines(song_id)");
   await pool.query("create index if not exists idx_timeline_markers_timeline_id on timeline_markers(timeline_id)");
   await pool.query("create index if not exists idx_timeline_votes_timeline_id on timeline_votes(timeline_id)");
+  await backfillModulationConfirmations();
+}
+
+async function refreshModulationConfirmation(db, songId, key, scale, timeMs) {
+  const result = await db.query(
+    `select m.id, m.confirmation_status, m.admin_approved, t.created_by_machine_id
+     from timeline_markers m
+     join song_timelines t on t.id = m.timeline_id
+     where t.song_id = $1
+       and m.marker_type = 'modulation'
+       and m.key = $2
+       and m.scale = $3
+       and abs(m.time_ms - $4) <= 1000
+     order by m.id asc
+     for update`,
+    [songId, key, scale, timeMs]
+  );
+  if (result.rows.length === 0) return null;
+
+  const machineIds = new Set(result.rows
+    .map(row => String(row.created_by_machine_id || "").trim())
+    .filter(Boolean));
+  const supportCount = machineIds.size;
+  const wasVerified = result.rows.some(row => row.admin_approved || row.confirmation_status === "verified");
+  const wasRejected = result.rows.some(row => row.confirmation_status === "rejected");
+  const status = wasVerified
+    ? "verified"
+    : wasRejected
+      ? "rejected"
+      : supportCount >= 3 ? "verified" : "pending";
+  const markerIds = result.rows.map(row => row.id);
+  await db.query(
+    `update timeline_markers
+     set confirmation_status = $2, confirmation_support_count = $3
+     where id = any($1::bigint[])`,
+    [markerIds, status, supportCount]
+  );
+  return { status, supportCount, markerIds };
+}
+
+async function backfillModulationConfirmations() {
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const result = await client.query(
+      `select t.song_id, m.key, m.scale, m.time_ms
+       from timeline_markers m
+       join song_timelines t on t.id = m.timeline_id
+       where m.marker_type = 'modulation'
+       order by t.song_id, m.key, m.scale, m.time_ms`
+    );
+    for (const row of result.rows) {
+      await refreshModulationConfirmation(client, row.song_id, row.key, row.scale, row.time_ms);
+    }
+    await client.query(
+      `update timeline_markers
+       set confirmation_status = 'verified', confirmation_support_count = greatest(1, confirmation_support_count)
+       where marker_type = 'initial_key'`
+    );
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function getSongByYouTubeVideoId(videoId) {
@@ -410,8 +544,9 @@ async function loadCommunityTimeline(videoId) {
 
   const markerRows = await pool.query(
     `select
-       m.time_ms, m.key, m.scale, m.marker_type, m.confidence,
-       t.vote_up, t.vote_down, t.use_count
+       m.id as marker_id, m.time_ms, m.key, m.scale, m.marker_type, m.confidence, m.admin_approved,
+       m.confirmation_status, m.confirmation_support_count,
+       t.id as timeline_id, t.created_by_machine_id, t.vote_up, t.vote_down, t.use_count
      from timeline_markers m
      join song_timelines t on t.id = m.timeline_id
      where t.song_id = $1
@@ -519,8 +654,9 @@ async function listTimelineSongs(searchText = "") {
   const markerResult = await pool.query(
     `select
        t.song_id,
-       m.time_ms, m.key, m.scale, m.marker_type, m.confidence,
-       t.vote_up, t.vote_down, t.use_count
+       m.id as marker_id, m.time_ms, m.key, m.scale, m.marker_type, m.confidence, m.admin_approved,
+       m.confirmation_status, m.confirmation_support_count,
+       t.id as timeline_id, t.created_by_machine_id, t.vote_up, t.vote_down, t.use_count
      from timeline_markers m
      join song_timelines t on t.id = m.timeline_id
      where t.song_id = any($1::bigint[])
@@ -575,8 +711,9 @@ async function getTimelineSongDetail(songId) {
     const markerResult = await pool.query(
       `select
          m.*,
-         t.song_id,
-         t.vote_up,
+          t.song_id,
+          t.created_by_machine_id,
+          t.vote_up,
          t.vote_down,
          t.use_count
        from timeline_markers m
@@ -600,8 +737,11 @@ async function getTimelineSongDetail(songId) {
       timeMs: Number(marker.time_ms || 0),
       key: marker.key || "",
       scale: marker.scale || "",
-      markerType: marker.marker_type || "",
-      confidence: Number(marker.confidence || 0)
+       markerType: marker.marker_type || "",
+       confidence: Number(marker.confidence || 0),
+       adminApproved: Boolean(marker.admin_approved),
+       confirmationStatus: marker.confirmation_status || "pending",
+       confirmationSupportCount: Number(marker.confirmation_support_count || 0)
     });
   }
 
@@ -654,12 +794,63 @@ async function deleteTimelineSong(songId) {
   return result.rows.length > 0;
 }
 
+async function setTimelineMarkerConfirmation(markerId, requestedStatus) {
+  const normalizedMarkerId = Math.floor(Number(markerId || 0));
+  const status = String(requestedStatus || "").toLowerCase();
+  if (!normalizedMarkerId || !["pending", "verified", "rejected"].includes(status)) return null;
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const markerResult = await client.query(
+      `select m.*, t.song_id
+       from timeline_markers m
+       join song_timelines t on t.id = m.timeline_id
+       where m.id = $1 and m.marker_type = 'modulation'
+       for update`,
+      [normalizedMarkerId]
+    );
+    const marker = markerResult.rows[0];
+    if (!marker) {
+      await client.query("rollback");
+      return null;
+    }
+    await client.query("select pg_advisory_xact_lock($1::bigint)", [marker.song_id]);
+    const groupResult = await client.query(
+      `update timeline_markers m
+       set confirmation_status = $5,
+           admin_approved = ($5 = 'verified')
+       from song_timelines t
+       where m.timeline_id = t.id
+         and t.song_id = $1
+         and m.marker_type = 'modulation'
+         and m.key = $2
+         and m.scale = $3
+         and abs(m.time_ms - $4) <= 1000
+       returning m.id`,
+      [marker.song_id, marker.key, marker.scale, marker.time_ms, status]
+    );
+    await client.query("commit");
+    return {
+      markerId: String(marker.id),
+      timelineId: String(marker.timeline_id),
+      status,
+      affectedMarkers: groupResult.rows.length
+    };
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 const TIMELINE_BACKUP_COLUMNS = [
   "format_version", "record_type", "song_backup_id", "youtube_video_id", "song_title", "artist",
   "duration_seconds", "song_created_at", "song_updated_at", "timeline_backup_id",
   "created_by_machine_id", "source", "vote_up", "vote_down", "use_count",
   "timeline_created_at", "timeline_updated_at", "marker_backup_id", "time_ms", "key", "scale",
-  "marker_type", "confidence", "vote_backup_id", "machine_id", "vote", "vote_created_at"
+  "marker_type", "confidence", "admin_approved", "confirmation_status", "confirmation_support_count",
+  "vote_backup_id", "machine_id", "vote", "vote_created_at"
 ];
 
 function escapeCsvValue(value) {
@@ -758,7 +949,9 @@ async function buildTimelineBackupCsv() {
     rows.push({
       format_version: "1", record_type: "marker", timeline_backup_id: marker.timeline_id,
       marker_backup_id: marker.id, time_ms: marker.time_ms, key: marker.key, scale: marker.scale,
-      marker_type: marker.marker_type, confidence: marker.confidence
+      marker_type: marker.marker_type, confidence: marker.confidence, admin_approved: marker.admin_approved,
+      confirmation_status: marker.confirmation_status,
+      confirmation_support_count: marker.confirmation_support_count
     });
   }
   for (const vote of voteResult.rows) {
@@ -807,6 +1000,7 @@ async function importTimelineBackupCsv(csvText) {
     }
 
     const timelineIdMap = new Map();
+    const timelineSongIdMap = new Map();
     for (const row of timelineRows) {
       const songId = songIdMap.get(String(row.song_backup_id));
       if (!songId || !row.timeline_backup_id) throw new Error("Timeline tham chieu song khong ton tai trong CSV.");
@@ -821,18 +1015,33 @@ async function importTimelineBackupCsv(csvText) {
           Math.max(0, Math.floor(backupNumber(row.use_count))), createdAt, updatedAt]
       );
       timelineIdMap.set(String(row.timeline_backup_id), result.rows[0].id);
+      timelineSongIdMap.set(String(row.timeline_backup_id), songId);
     }
 
     for (const row of markerRows) {
       const timelineId = timelineIdMap.get(String(row.timeline_backup_id));
+      const songId = timelineSongIdMap.get(String(row.timeline_backup_id));
       if (!timelineId) throw new Error("Marker tham chieu timeline khong ton tai trong CSV.");
+      const timeMs = Math.max(0, Math.floor(backupNumber(row.time_ms)));
+      const key = normalizeTimelineKey(row.key);
+      const scale = normalizeScale(row.scale);
+      const markerType = normalizeMarkerType(row.marker_type, 0);
       await client.query(
-        `insert into timeline_markers (timeline_id, time_ms, key, scale, marker_type, confidence)
-         values ($1,$2,$3,$4,$5,$6)`,
-        [timelineId, Math.max(0, Math.floor(backupNumber(row.time_ms))), normalizeTimelineKey(row.key),
-          normalizeScale(row.scale), normalizeMarkerType(row.marker_type, 0),
-          Math.max(0, Math.min(1, backupNumber(row.confidence, 1)))]
+        `insert into timeline_markers
+           (timeline_id, time_ms, key, scale, marker_type, confidence, admin_approved,
+            confirmation_status, confirmation_support_count)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [timelineId, timeMs, key, scale, markerType,
+          Math.max(0, Math.min(1, backupNumber(row.confidence, 1))),
+          String(row.admin_approved).toLowerCase() === "true",
+          ["pending", "verified", "rejected"].includes(String(row.confirmation_status).toLowerCase())
+            ? String(row.confirmation_status).toLowerCase()
+            : "pending",
+          Math.max(0, Math.floor(backupNumber(row.confirmation_support_count)))]
       );
+      if (markerType === "modulation") {
+        await refreshModulationConfirmation(client, songId, key, scale, timeMs);
+      }
     }
 
     for (const row of voteRows) {
@@ -923,6 +1132,7 @@ app.post("/api/song-timelines", async (req, res) => {
     const now = nowSeconds();
     client = await pool.connect();
     await client.query("begin");
+    await client.query("select pg_advisory_xact_lock($1::bigint)", [song.id]);
     const timelineResult = await client.query(
       `insert into song_timelines (song_id, created_by_machine_id, source, created_at, updated_at)
        values ($1,$2,$3,$4,$4)
@@ -942,6 +1152,14 @@ app.post("/api/song-timelines", async (req, res) => {
          values ($1,$2,$3,$4,$5,$6)`,
         [timeline.id, marker.timeMs, marker.key, marker.scale, marker.markerType, marker.confidence]
       );
+      if (marker.markerType === "modulation") {
+        await refreshModulationConfirmation(
+          client,
+          song.id,
+          marker.key,
+          marker.scale,
+          marker.timeMs);
+      }
     }
 
     await client.query("commit");
@@ -1063,6 +1281,38 @@ app.post("/api/admin/delete-timeline", async (req, res) => {
     return res.json({ ok: true, message: "Timeline deleted.", timelineId: String(req.body.timelineId || "") });
   } catch (error) {
     return res.status(500).json({ ok: false, message: "Timeline delete failed: " + error.message });
+  }
+});
+
+app.post("/api/admin/approve-timeline-marker", async (req, res) => {
+  try {
+    if (!checkTimelineAdminToken(req, res)) return;
+    const marker = await setTimelineMarkerConfirmation(req.body.markerId, "verified");
+    if (!marker) {
+      return res.status(404).json({ ok: false, message: "Modulation marker not found." });
+    }
+    return res.json({
+      ok: true,
+      message: "Marker da duoc admin xac nhan.",
+      markerId: marker.markerId,
+      timelineId: marker.timelineId,
+      status: marker.status
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: "Marker approval failed: " + error.message });
+  }
+});
+
+app.post("/api/admin/set-marker-confirmation", async (req, res) => {
+  try {
+    if (!checkTimelineAdminToken(req, res)) return;
+    const marker = await setTimelineMarkerConfirmation(req.body.markerId, req.body.status);
+    if (!marker) {
+      return res.status(404).json({ ok: false, message: "Modulation marker or status not valid." });
+    }
+    return res.json({ ok: true, message: "Da cap nhat trang thai xac nhan.", ...marker });
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: "Marker confirmation failed: " + error.message });
   }
 });
 
@@ -1190,7 +1440,33 @@ app.get("/admin/timelines", (req, res) => {
     async function deleteTimeline(timelineId){ if(!confirm("Xoa timeline #"+timelineId+"?")) return; try{ const data=await api("/api/admin/delete-timeline",{adminToken:getToken(),timelineId}); showResult(data); if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
     async function deleteSong(songId){ const song=songs.find(item=>item.songId===String(songId)); if(!confirm("Xoa ca bai nay va tat ca timeline?\\n\\n"+(song?.title||song?.youtubeVideoId||songId))) return; try{ const data=await api("/api/admin/delete-timeline-song",{adminToken:getToken(),songId}); showResult(data); selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; await loadSongs(); }catch(e){ showResult(e); } }
     function renderSongs(){ $("songCount").textContent=songs.length+" bai"; $("summaryText").textContent="Dang hien thi "+songs.length+" bai."; $("songRows").innerHTML=songs.map(song=>{ const title=song.title||"(chua co ten)"; const youtubeUrl="https://www.youtube.com/watch?v="+encodeURIComponent(song.youtubeVideoId); return '<tr><td><b>'+escapeText(song.youtubeVideoId)+'</b><div><a href="'+youtubeUrl+'" target="_blank">Mo YouTube</a></div></td><td>'+escapeText(title)+'<div class="muted">'+escapeText(song.artist||"")+'</div></td><td>'+escapeText(formatTime(song.durationSeconds))+'</td><td>'+renderAggregateMarkers(song.aggregateMarkers,true)+'</td><td>'+escapeText(formatDate(song.lastTimelineAt||song.updatedAt))+'</td><td class="actions"><button class="secondary" onclick="showSong(\\''+escapeText(song.songId)+'\\')">Chi tiet</button><button class="danger" onclick="deleteSong(\\''+escapeText(song.songId)+'\\')">Xoa bai</button></td></tr>'; }).join(""); }
-    function renderDetail(song){ const timelines=song.timelines||[]; const stats='<div class="stat-grid"><div class="stat"><span class="muted">Timeline</span><b>'+escapeText(song.timelineCount||0)+'</b></div><div class="stat"><span class="muted">Moc</span><b>'+escapeText(song.markerCount||0)+'</b></div><div class="stat"><span class="muted">Luot dung</span><b>'+escapeText(song.useCount||0)+'</b></div></div>'; const aggregate='<div style="border:1px solid #2a2f3a;border-radius:12px;padding:12px;margin:12px 0"><div style="font-weight:750;margin-bottom:8px">Ket qua tong hop</div>'+renderAggregateMarkers(song.aggregateMarkers)+'</div>'; $("detailBox").innerHTML='<div><b>'+escapeText(song.title||song.youtubeVideoId)+'</b></div><div class="muted">YouTube ID: '+escapeText(song.youtubeVideoId)+' | '+escapeText(formatTime(song.durationSeconds))+'</div>'+stats+aggregate+'<div style="margin-top:12px">'+timelines.map(timeline=>{ const markers=timeline.markers||[]; return '<div style="border:1px solid #2a2f3a;border-radius:12px;padding:12px;margin-bottom:12px"><div class="row"><div><b>Timeline #'+escapeText(timeline.timelineId)+'</b><div class="muted">source: '+escapeText(timeline.source||"-")+' | machine: '+escapeText(timeline.createdByMachineId||"-")+'</div></div><div><span class="pill">up '+escapeText(timeline.voteUp)+'</span> <span class="pill">down '+escapeText(timeline.voteDown)+'</span> <span class="pill">use '+escapeText(timeline.useCount)+'</span></div><div style="flex:0 0 auto"><button class="danger" onclick="deleteTimeline(\\''+escapeText(timeline.timelineId)+'\\')">Xoa timeline</button></div></div><div class="muted" style="margin:8px 0">updated: '+escapeText(formatDate(timeline.updatedAt))+'</div><table style="min-width:0"><thead><tr><th>Time</th><th>Key</th><th>Scale</th><th>Type</th><th>Confidence</th></tr></thead><tbody>'+markers.map(marker=>'<tr><td>'+escapeText(formatTime(marker.timeMs/1000))+'</td><td>'+escapeText(marker.key)+'</td><td>'+escapeText(marker.scale)+'</td><td>'+escapeText(marker.markerType)+'</td><td>'+escapeText(marker.confidence)+'</td></tr>').join("")+'</tbody></table></div>'; }).join("")+'</div>'; }
+    async function setMarkerConfirmation(markerId,status){ const label=status==="verified"?"duyet":status==="rejected"?"tu choi/thu hoi":"dua ve cho"; if(!confirm("Admin "+label+" moc len tone nay?")) return; try{ const data=await api("/api/admin/set-marker-confirmation",{adminToken:getToken(),markerId,status}); showResult(data); if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
+    function renderDetail(song){
+      const timelines=song.timelines||[];
+      const stats='<div class="stat-grid"><div class="stat"><span class="muted">Timeline</span><b>'+escapeText(song.timelineCount||0)+'</b></div><div class="stat"><span class="muted">Moc</span><b>'+escapeText(song.markerCount||0)+'</b></div><div class="stat"><span class="muted">Luot dung</span><b>'+escapeText(song.useCount||0)+'</b></div></div>';
+      const aggregate='<div style="border:1px solid #2a2f3a;border-radius:12px;padding:12px;margin:12px 0"><div style="font-weight:750;margin-bottom:8px">Ket qua tong hop</div>'+renderAggregateMarkers(song.aggregateMarkers)+'</div>';
+      const timelineHtml=timelines.map(timeline=>{
+        const markers=timeline.markers||[];
+        const markerRows=markers.map(marker=>{
+          const isInitial=marker.markerType==="initial_key";
+          const support=Math.min(3,Number(marker.confirmationSupportCount)||0);
+          let status;
+          if(isInitial){
+            status='<span class="pill">Dau bai</span>';
+          }else if(marker.confirmationStatus==="verified"){
+            const verifiedLabel=marker.adminApproved?'Admin da duyet':'Da xac nhan '+support+'/3 may';
+            status='<span class="pill" style="background:rgba(34,197,94,.18);color:#86efac">'+verifiedLabel+'</span> <button class="danger" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'rejected\\')">Thu hoi</button>';
+          }else if(marker.confirmationStatus==="rejected"){
+            status='<span class="pill" style="background:rgba(220,38,38,.18);color:#fca5a5">Da tu choi</span> <button class="secondary" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'verified\\')">Admin duyet</button>';
+          }else{
+            status='<span class="muted">Cho xac nhan '+support+'/3 may</span> <button class="secondary" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'verified\\')">Admin duyet</button> <button class="danger" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'rejected\\')">Tu choi</button>';
+          }
+          return '<tr><td>'+escapeText(formatTime(marker.timeMs/1000))+'</td><td>'+escapeText(marker.key)+'</td><td>'+escapeText(marker.scale)+'</td><td>'+escapeText(marker.markerType)+'</td><td>'+escapeText(marker.confidence)+'</td><td>'+status+'</td></tr>';
+        }).join("");
+        return '<div style="border:1px solid #2a2f3a;border-radius:12px;padding:12px;margin-bottom:12px"><div class="row"><div><b>Timeline #'+escapeText(timeline.timelineId)+'</b><div class="muted">source: '+escapeText(timeline.source||"-")+' | machine: '+escapeText(timeline.createdByMachineId||"-")+'</div></div><div><span class="pill">up '+escapeText(timeline.voteUp)+'</span> <span class="pill">down '+escapeText(timeline.voteDown)+'</span> <span class="pill">use '+escapeText(timeline.useCount)+'</span></div><div style="flex:0 0 auto"><button class="danger" onclick="deleteTimeline(\\''+escapeText(timeline.timelineId)+'\\')">Xoa timeline</button></div></div><div class="muted" style="margin:8px 0">updated: '+escapeText(formatDate(timeline.updatedAt))+'</div><table style="min-width:0"><thead><tr><th>Time</th><th>Key</th><th>Scale</th><th>Type</th><th>Confidence</th><th>Xac nhan</th></tr></thead><tbody>'+markerRows+'</tbody></table></div>';
+      }).join("");
+      $("detailBox").innerHTML='<div><b>'+escapeText(song.title||song.youtubeVideoId)+'</b></div><div class="muted">YouTube ID: '+escapeText(song.youtubeVideoId)+' | '+escapeText(formatTime(song.durationSeconds))+'</div>'+stats+aggregate+'<div style="margin-top:12px">'+timelineHtml+'</div>';
+    }
     async function exportCsv(){ try{ $("backupStatus").textContent="Dang tao file CSV..."; const res=await fetch("/api/admin/timeline-backup/export.csv?adminToken="+encodeURIComponent(getToken())); if(!res.ok){ const error=await res.json(); throw error; } const blob=await res.blob(); const url=URL.createObjectURL(blob); const link=document.createElement("a"); link.href=url; link.download="pluginlocker-timeline-backup-"+new Date().toISOString().slice(0,10)+".csv"; document.body.appendChild(link); link.click(); link.remove(); setTimeout(()=>URL.revokeObjectURL(url),1000); $("backupStatus").textContent="Da xuat file CSV thanh cong."; }catch(e){ $("backupStatus").textContent=e.message||"Xuat CSV that bai."; showResult(e); } }
     async function importCsv(){ const file=$("importCsvFile").files[0]; if(!file){ $("backupStatus").textContent="Hay chon file CSV can nhap."; return; } if(!confirm("Nhap backup nay? Timeline hien tai cua cac bai co trong file se bi thay the.")) return; try{ $("backupStatus").textContent="Dang nhap va khoi phuc CSV..."; const csv=await file.text(); const res=await fetch("/api/admin/timeline-backup/import?adminToken="+encodeURIComponent(getToken()),{method:"POST",headers:{"Content-Type":"text/csv; charset=utf-8"},body:csv}); const data=await res.json(); if(!res.ok) throw data; $("backupStatus").textContent="Nhap thanh cong: "+data.imported.songs+" bai, "+data.imported.timelines+" timeline, "+data.imported.markers+" moc."; showResult(data); selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; await loadSongs(); }catch(e){ $("backupStatus").textContent=e.message||"Nhap CSV that bai."; showResult(e); } }
     restoreToken(); $("saveTokenBtn").addEventListener("click", saveToken); $("loadBtn").addEventListener("click", loadSongs); $("exportCsvBtn").addEventListener("click", exportCsv); $("importCsvBtn").addEventListener("click", importCsv); $("searchBox").addEventListener("keydown", event => { if(event.key === "Enter") loadSongs(); }); loadSongs();
