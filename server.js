@@ -216,7 +216,7 @@ function aggregateTimelineMarkers(rows, timelineCount) {
     cluster.supportCount = winner.supportCount;
   }
 
-  return clusters
+  const aggregateMarkers = clusters
     .filter(cluster => cluster.score >= 0.25)
     .sort((a, b) => a.timeMs - b.timeMs || b.score - a.score)
     .reduce((markers, cluster) => {
@@ -224,6 +224,7 @@ function aggregateTimelineMarkers(rows, timelineCount) {
       if (previous &&
           previous.key === cluster.key &&
           previous.scale === cluster.scale &&
+          previous.markerType === cluster.markerType &&
           Math.abs(previous.timeMs - cluster.timeMs) <= TIMELINE_MATCH_TOLERANCE_MS) {
         if (cluster.score > previous.score) {
           markers[markers.length - 1] = cluster;
@@ -242,6 +243,22 @@ function aggregateTimelineMarkers(rows, timelineCount) {
       confidence: clusterConfidence(cluster, timelineCount),
       supportCount: cluster.supportCount
     }));
+
+  const initialMarker = aggregateMarkers
+    .filter(marker => marker.markerType === "initial_key")
+    .sort((left, right) =>
+      right.confidence - left.confidence ||
+      right.supportCount - left.supportCount ||
+      left.timeMs - right.timeMs)[0];
+  if (!initialMarker) {
+    return aggregateMarkers;
+  }
+
+  return aggregateMarkers.filter(marker =>
+    marker.markerType === "initial_key" ||
+    marker.key !== initialMarker.key ||
+    marker.scale !== initialMarker.scale
+  );
 }
 
 function formatAggregateSummary(markers) {
