@@ -1114,6 +1114,10 @@ app.get("/admin/timelines", (req, res) => {
       <div style="flex:0 0 auto; align-self:end"><button id="loadBtn" type="button">Tai danh sach</button></div>
       <div style="flex:0 0 auto; align-self:end"><button id="saveTokenBtn" class="secondary" type="button">Luu token</button></div>
     </div><div id="summaryText" class="muted" style="margin-top:12px">Chua tai du lieu.</div></section>
+    <section class="card"><div class="toolbar"><h2 style="margin:0">Bai da upload</h2><span class="pill" id="songCount">0 bai</span></div>
+      <div class="song-table-wrap"><table><thead><tr><th style="width:220px">YouTube</th><th style="width:260px">Ten bai</th><th style="width:110px">Thoi luong</th><th>Ket qua tong hop</th><th style="width:180px">Cap nhat</th><th style="width:220px">Thao tac</th></tr></thead><tbody id="songRows"></tbody></table></div>
+    </section>
+    <section class="detail-grid"><div class="card"><h2 style="margin-top:0">Chi tiet timeline</h2><div id="detailBox" class="muted">Chon mot bai de xem timeline.</div></div><div class="card"><h2 style="margin-top:0">Ket qua API</h2><pre id="resultBox">Chua co thao tac.</pre></div></section>
     <section class="card">
       <div class="toolbar"><div><h2 style="margin:0 0 4px">Sao luu / chuyen server</h2><div class="muted">Xuat CSV de backup. Khi nhap, timeline cua cac bai co trong file se duoc khoi phuc va thay the du lieu cu cua chinh cac bai do.</div></div></div>
       <div class="row">
@@ -1123,10 +1127,6 @@ app.get("/admin/timelines", (req, res) => {
       </div>
       <div id="backupStatus" class="muted" style="margin-top:10px">Chua co thao tac backup.</div>
     </section>
-    <section class="card"><div class="toolbar"><h2 style="margin:0">Bai da upload</h2><span class="pill" id="songCount">0 bai</span></div>
-      <div class="song-table-wrap"><table><thead><tr><th style="width:220px">YouTube</th><th style="width:260px">Ten bai</th><th style="width:110px">Thoi luong</th><th>Ket qua tong hop</th><th style="width:180px">Cap nhat</th><th style="width:220px">Thao tac</th></tr></thead><tbody id="songRows"></tbody></table></div>
-    </section>
-    <section class="detail-grid"><div class="card"><h2 style="margin-top:0">Chi tiet timeline</h2><div id="detailBox" class="muted">Chon mot bai de xem timeline.</div></div><div class="card"><h2 style="margin-top:0">Ket qua API</h2><pre id="resultBox">Chua co thao tac.</pre></div></section>
   </main>
   <script>
     let songs = []; let selectedSong = null; const $ = id => document.getElementById(id);
