@@ -1398,6 +1398,32 @@ app.post("/api/admin/delete-timeline-song", async (req, res) => {
   }
 });
 
+app.post("/api/admin/delete-timeline-songs", async (req, res) => {
+  try {
+    if (!checkTimelineAdminToken(req, res)) return;
+    const songIds = [...new Set((Array.isArray(req.body.songIds) ? req.body.songIds : [])
+      .map(value => Math.floor(Number(value || 0)))
+      .filter(Boolean))]
+      .slice(0, 1000);
+    if (songIds.length === 0) {
+      return res.status(400).json({ ok: false, message: "No valid song IDs selected." });
+    }
+
+    const result = await pool.query(
+      "delete from songs where id = any($1::bigint[]) returning id",
+      [songIds]
+    );
+    return res.json({
+      ok: true,
+      message: "Selected songs and timelines deleted.",
+      deletedCount: result.rows.length,
+      songIds: result.rows.map(row => String(row.id))
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: "Bulk song delete failed: " + error.message });
+  }
+});
+
 app.get("/api/admin/timeline-backup/export.csv", async (req, res) => {
   try {
     if (!checkTimelineAdminToken(req, res)) return;
@@ -1443,7 +1469,10 @@ app.get("/admin/timelines", (req, res) => {
     .card { background:#171a22; border:1px solid #2a2f3a; border-radius:14px; padding:16px; margin-bottom:18px; }
     label { display:block; font-size:12px; color:#a8b0c0; margin:10px 0 6px; }
     input { width:100%; box-sizing:border-box; border:1px solid #333a48; border-radius:10px; padding:10px 12px; background:#0f1117; color:#fff; }
+    input[type="checkbox"] { width:18px; height:18px; padding:0; accent-color:#3b82f6; cursor:pointer; }
+    select { box-sizing:border-box; border:1px solid #333a48; border-radius:10px; padding:9px 34px 9px 12px; background:#0f1117; color:#fff; }
     button { border:0; border-radius:10px; padding:9px 12px; background:#3b82f6; color:white; cursor:pointer; font-weight:650; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
     button.secondary { background:#374151; }
     button.danger { background:#dc2626; }
     .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
@@ -1478,7 +1507,12 @@ app.get("/admin/timelines", (req, res) => {
       <div style="flex:0 0 auto; align-self:end"><button id="saveTokenBtn" class="secondary" type="button">Luu token</button></div>
     </div><div id="summaryText" class="muted" style="margin-top:12px">Chua tai du lieu.</div></section>
     <section class="card"><div class="toolbar"><h2 style="margin:0">Bai da upload</h2><span class="pill" id="songCount">0 bai</span></div>
-      <div class="song-table-wrap"><table><thead><tr><th style="width:220px">YouTube</th><th style="width:260px">Ten bai</th><th style="width:110px">Thoi luong</th><th>Ket qua tong hop</th><th style="width:180px">Cap nhat</th><th style="width:220px">Thao tac</th></tr></thead><tbody id="songRows"></tbody></table></div>
+      <div class="row" style="margin-bottom:12px">
+        <div><label style="margin-top:0">Loc theo ten bai</label><select id="titleFilter"><option value="all">Tat ca bai</option><option value="karaoke">Co Beat hoac Karaoke</option><option value="non-karaoke">Khong co Beat/Karaoke</option></select></div>
+        <div style="flex:0 0 auto;min-width:0;align-self:end"><button id="deleteSelectedSongsBtn" class="danger" type="button" disabled>Xoa cac bai da chon</button></div>
+        <div id="selectionSummary" class="muted" style="flex:0 0 auto;min-width:120px;align-self:end;padding-bottom:9px">Da chon 0 bai</div>
+      </div>
+      <div class="song-table-wrap"><table><thead><tr><th style="width:44px;text-align:center"><input id="selectAllSongs" type="checkbox" title="Chon tat ca ket qua dang hien thi" /></th><th style="width:220px">YouTube</th><th style="width:260px">Ten bai</th><th style="width:110px">Thoi luong</th><th>Ket qua tong hop</th><th style="width:180px">Cap nhat</th><th style="width:220px">Thao tac</th></tr></thead><tbody id="songRows"></tbody></table></div>
     </section>
     <section class="detail-grid"><div class="card"><h2 style="margin-top:0">Chi tiet timeline</h2><div id="detailBox" class="muted">Chon mot bai de xem timeline.</div></div><div class="card"><h2 style="margin-top:0">Ket qua API</h2><pre id="resultBox">Chua co thao tac.</pre></div></section>
     <section class="card">
@@ -1492,7 +1526,7 @@ app.get("/admin/timelines", (req, res) => {
     </section>
   </main>
   <script>
-    let songs = []; let selectedSong = null; const $ = id => document.getElementById(id);
+    let songs = []; let selectedSong = null; const selectedSongIds = new Set(); const $ = id => document.getElementById(id);
     function getToken(){ return $("adminToken").value.trim(); }
     function restoreToken(){ const params=new URLSearchParams(window.location.search); const urlToken=params.get("adminToken")||""; const storedToken=localStorage.getItem("pluginlockerTimelineAdminToken")||""; $("adminToken").value=urlToken||storedToken; if(urlToken){ localStorage.setItem("pluginlockerTimelineAdminToken",urlToken); window.history.replaceState({},document.title,window.location.pathname); } }
     function saveToken(){ localStorage.setItem("pluginlockerTimelineAdminToken", getToken()); showResult({ok:true,message:"Da luu timeline token trong trinh duyet nay."}); }
@@ -1503,11 +1537,18 @@ app.get("/admin/timelines", (req, res) => {
     function pickBestAggregateMarkers(markers){ markers=Array.isArray(markers)?markers:[]; const byAccuracy=(a,b)=>(Number(b.confidence)||0)-(Number(a.confidence)||0)||(Number(b.supportCount)||0)-(Number(a.supportCount)||0)||(Number(a.timeMs)||0)-(Number(b.timeMs)||0); const bestInitial=markers.filter(marker=>marker.markerType==="initial_key").sort(byAccuracy)[0]; const bestModulation=markers.filter(marker=>marker.markerType!=="initial_key").sort(byAccuracy)[0]; return [bestInitial,bestModulation].filter(Boolean); }
     function renderAggregateMarkers(markers, compact=false){ markers=compact?pickBestAggregateMarkers(markers):(Array.isArray(markers)?markers:[]); if(!markers.length) return '<span class="muted">Chua co ket qua tong hop</span>'; return '<div class="summary-lines">'+markers.slice(0,compact?2:4).map(marker=>{ const percent=Math.round(Math.max(0,Math.min(1,Number(marker.confidence)||0))*100); const label=marker.markerType==="initial_key"?"Dau bai":"Len tone"; return '<div class="summary-line"><span class="pill">'+escapeText(label)+'</span><span class="summary-key">'+escapeText(marker.key)+' '+escapeText(marker.scale)+'</span><span class="summary-meta">'+percent+'%</span><span class="muted">@ '+escapeText(formatTime((marker.timeMs||0)/1000))+'</span><span class="muted">support '+escapeText(marker.supportCount||0)+'</span></div>'; }).join("")+'</div>'; }
     async function api(path, body){ const res=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); const text=await res.text(); let data; try{data=JSON.parse(text)}catch{data={ok:false,message:text}} if(!res.ok) throw data; return data; }
-    async function loadSongs(){ try{ const q=encodeURIComponent($("searchBox").value.trim()); const res=await fetch("/api/admin/timeline-songs?adminToken="+encodeURIComponent(getToken())+"&q="+q); const data=await res.json(); if(!res.ok) throw data; songs=data.songs||[]; showResult(data); renderSongs(); }catch(e){ showResult(e); } }
+    async function loadSongs(){ try{ const q=encodeURIComponent($("searchBox").value.trim()); const res=await fetch("/api/admin/timeline-songs?adminToken="+encodeURIComponent(getToken())+"&q="+q); const data=await res.json(); if(!res.ok) throw data; songs=data.songs||[]; selectedSongIds.clear(); showResult(data); renderSongs(); }catch(e){ showResult(e); } }
     async function showSong(songId){ try{ const res=await fetch("/api/admin/timeline-songs/"+encodeURIComponent(songId)+"?adminToken="+encodeURIComponent(getToken())); const data=await res.json(); if(!res.ok) throw data; selectedSong=data.song; showResult(data); renderDetail(data.song); }catch(e){ showResult(e); } }
     async function deleteTimeline(timelineId){ if(!confirm("Xoa timeline #"+timelineId+"?")) return; try{ const data=await api("/api/admin/delete-timeline",{adminToken:getToken(),timelineId}); showResult(data); if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
     async function deleteSong(songId){ const song=songs.find(item=>item.songId===String(songId)); if(!confirm("Xoa ca bai nay va tat ca timeline?\\n\\n"+(song?.title||song?.youtubeVideoId||songId))) return; try{ const data=await api("/api/admin/delete-timeline-song",{adminToken:getToken(),songId}); showResult(data); selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; await loadSongs(); }catch(e){ showResult(e); } }
-    function renderSongs(){ $("songCount").textContent=songs.length+" bai"; $("summaryText").textContent="Dang hien thi "+songs.length+" bai."; $("songRows").innerHTML=songs.map(song=>{ const title=song.title||"(chua co ten)"; const youtubeUrl="https://www.youtube.com/watch?v="+encodeURIComponent(song.youtubeVideoId); return '<tr><td><b>'+escapeText(song.youtubeVideoId)+'</b><div><a href="'+youtubeUrl+'" target="_blank">Mo YouTube</a></div></td><td>'+escapeText(title)+'<div class="muted">'+escapeText(song.artist||"")+'</div></td><td>'+escapeText(formatTime(song.durationSeconds))+'</td><td>'+renderAggregateMarkers(song.aggregateMarkers,true)+'</td><td>'+escapeText(formatDate(song.lastTimelineAt||song.updatedAt))+'</td><td class="actions"><button class="secondary" onclick="showSong(\\''+escapeText(song.songId)+'\\')">Chi tiet</button><button class="danger" onclick="deleteSong(\\''+escapeText(song.songId)+'\\')">Xoa bai</button></td></tr>'; }).join(""); }
+    function isKaraokeTitle(song){ const title=String(song?.title||"").toLocaleLowerCase(); return title.includes("beat")||title.includes("karaoke"); }
+    function getFilteredSongs(){ const filter=$("titleFilter").value; if(filter==="karaoke") return songs.filter(isKaraokeTitle); if(filter==="non-karaoke") return songs.filter(song=>!isKaraokeTitle(song)); return songs; }
+    function updateSelectionUi(){ const visible=getFilteredSongs(); const selectedVisible=visible.filter(song=>selectedSongIds.has(String(song.songId))).length; const all=$("selectAllSongs"); all.checked=visible.length>0&&selectedVisible===visible.length; all.indeterminate=selectedVisible>0&&selectedVisible<visible.length; $("selectionSummary").textContent="Da chon "+selectedSongIds.size+" bai"; $("deleteSelectedSongsBtn").disabled=selectedSongIds.size===0; }
+    function toggleSongSelection(songId,checked){ if(checked) selectedSongIds.add(String(songId)); else selectedSongIds.delete(String(songId)); updateSelectionUi(); }
+    function toggleSelectAllFiltered(checked){ for(const song of getFilteredSongs()){ if(checked) selectedSongIds.add(String(song.songId)); else selectedSongIds.delete(String(song.songId)); } renderSongs(); }
+    function applyTitleFilter(){ selectedSongIds.clear(); renderSongs(); }
+    async function deleteSelectedSongs(){ const ids=[...selectedSongIds]; if(!ids.length) return; if(!confirm("Xoa vinh vien "+ids.length+" bai da chon va toan bo timeline/hop am lien quan?")) return; try{ const data=await api("/api/admin/delete-timeline-songs",{adminToken:getToken(),songIds:ids}); showResult(data); if(selectedSong&&ids.includes(String(selectedSong.songId))){ selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; } await loadSongs(); }catch(e){ showResult(e); } }
+    function renderSongs(){ const visible=getFilteredSongs(); $("songCount").textContent=visible.length+" / "+songs.length+" bai"; $("summaryText").textContent="Dang hien thi "+visible.length+" tren "+songs.length+" bai."; $("songRows").innerHTML=visible.map(song=>{ const id=String(song.songId); const title=song.title||"(chua co ten)"; const youtubeUrl="https://www.youtube.com/watch?v="+encodeURIComponent(song.youtubeVideoId); const checked=selectedSongIds.has(id)?" checked":""; return '<tr><td style="text-align:center"><input type="checkbox"'+checked+' onchange="toggleSongSelection(\\''+escapeText(id)+'\\',this.checked)" /></td><td><b>'+escapeText(song.youtubeVideoId)+'</b><div><a href="'+youtubeUrl+'" target="_blank">Mo YouTube</a></div></td><td>'+escapeText(title)+'<div class="muted">'+escapeText(song.artist||"")+'</div></td><td>'+escapeText(formatTime(song.durationSeconds))+'</td><td>'+renderAggregateMarkers(song.aggregateMarkers,true)+'</td><td>'+escapeText(formatDate(song.lastTimelineAt||song.updatedAt))+'</td><td class="actions"><button class="secondary" onclick="showSong(\\''+escapeText(id)+'\\')">Chi tiet</button><button class="danger" onclick="deleteSong(\\''+escapeText(id)+'\\')">Xoa bai</button></td></tr>'; }).join(""); updateSelectionUi(); }
     async function setMarkerConfirmation(markerId,status){ const label=status==="verified"?"duyet":status==="rejected"?"tu choi/thu hoi":"dua ve cho"; if(!confirm("Admin "+label+" moc len tone nay?")) return; try{ const data=await api("/api/admin/set-marker-confirmation",{adminToken:getToken(),markerId,status}); showResult(data); if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
     function renderDetail(song){
       const timelines=song.timelines||[];
@@ -1537,7 +1578,7 @@ app.get("/admin/timelines", (req, res) => {
     }
     async function exportCsv(){ try{ $("backupStatus").textContent="Dang tao file CSV..."; const res=await fetch("/api/admin/timeline-backup/export.csv?adminToken="+encodeURIComponent(getToken())); if(!res.ok){ const error=await res.json(); throw error; } const blob=await res.blob(); const url=URL.createObjectURL(blob); const link=document.createElement("a"); link.href=url; link.download="pluginlocker-timeline-backup-"+new Date().toISOString().slice(0,10)+".csv"; document.body.appendChild(link); link.click(); link.remove(); setTimeout(()=>URL.revokeObjectURL(url),1000); $("backupStatus").textContent="Da xuat file CSV thanh cong."; }catch(e){ $("backupStatus").textContent=e.message||"Xuat CSV that bai."; showResult(e); } }
     async function importCsv(){ const file=$("importCsvFile").files[0]; if(!file){ $("backupStatus").textContent="Hay chon file CSV can nhap."; return; } if(!confirm("Nhap backup nay? Timeline hien tai cua cac bai co trong file se bi thay the.")) return; try{ $("backupStatus").textContent="Dang nhap va khoi phuc CSV..."; const csv=await file.text(); const res=await fetch("/api/admin/timeline-backup/import?adminToken="+encodeURIComponent(getToken()),{method:"POST",headers:{"Content-Type":"text/csv; charset=utf-8"},body:csv}); const data=await res.json(); if(!res.ok) throw data; $("backupStatus").textContent="Nhap thanh cong: "+data.imported.songs+" bai, "+data.imported.timelines+" timeline, "+data.imported.markers+" moc."; showResult(data); selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; await loadSongs(); }catch(e){ $("backupStatus").textContent=e.message||"Nhap CSV that bai."; showResult(e); } }
-    restoreToken(); $("saveTokenBtn").addEventListener("click", saveToken); $("loadBtn").addEventListener("click", loadSongs); $("exportCsvBtn").addEventListener("click", exportCsv); $("importCsvBtn").addEventListener("click", importCsv); $("searchBox").addEventListener("keydown", event => { if(event.key === "Enter") loadSongs(); }); loadSongs();
+    restoreToken(); $("saveTokenBtn").addEventListener("click", saveToken); $("loadBtn").addEventListener("click", loadSongs); $("exportCsvBtn").addEventListener("click", exportCsv); $("importCsvBtn").addEventListener("click", importCsv); $("titleFilter").addEventListener("change", applyTitleFilter); $("selectAllSongs").addEventListener("change", event=>toggleSelectAllFiltered(event.target.checked)); $("deleteSelectedSongsBtn").addEventListener("click", deleteSelectedSongs); $("searchBox").addEventListener("keydown", event => { if(event.key === "Enter") loadSongs(); }); loadSongs();
   </script>
 </body>
 </html>`);
