@@ -83,11 +83,11 @@ function normalizeYouTubeVideoId(value) {
 function normalizeTimelineKey(value) {
   const key = String(value || "").trim();
   const aliases = {
-    "C#": "DB",
-    "D#": "EB",
-    "F#": "GB",
-    "G#": "AB",
-    "A#": "BB"
+    "DB": "C#",
+    "EB": "D#",
+    "GB": "F#",
+    "AB": "G#",
+    "BB": "A#"
   };
   const normalized = key.replace("\u266f", "#").replace("\u266d", "B").toUpperCase();
   return aliases[normalized] || normalized;
@@ -380,6 +380,18 @@ async function ensureSchema() {
   await pool.query(
     "alter table timeline_markers add column if not exists confirmation_support_count integer not null default 0"
   );
+  await pool.query(`
+    update timeline_markers
+    set key = case upper(trim(key))
+      when 'DB' then 'C#'
+      when 'EB' then 'D#'
+      when 'GB' then 'F#'
+      when 'AB' then 'G#'
+      when 'BB' then 'A#'
+      else key
+    end
+    where upper(trim(key)) in ('DB', 'EB', 'GB', 'AB', 'BB')
+  `);
   await pool.query(`
     create table if not exists timeline_server_settings (
       setting_key text primary key,
