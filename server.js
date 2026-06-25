@@ -612,7 +612,11 @@ async function listTimelineSongs(searchText = "") {
      marker_stats as (
        select
          t.song_id,
-         count(m.id)::int as marker_count
+         count(m.id)::int as marker_count,
+         count(m.id) filter (
+           where m.marker_type = 'modulation'
+             and coalesce(m.confirmation_status, 'pending') = 'pending'
+         )::int as pending_modulation_count
        from song_timelines t
        left join timeline_markers m on m.timeline_id = t.id
        where t.song_id in (select id from filtered_songs)
@@ -628,6 +632,7 @@ async function listTimelineSongs(searchText = "") {
        s.updated_at,
        coalesce(ts.timeline_count, 0)::int as timeline_count,
        coalesce(ms.marker_count, 0)::int as marker_count,
+       coalesce(ms.pending_modulation_count, 0)::int as pending_modulation_count,
        coalesce(ts.vote_up, 0)::int as vote_up,
        coalesce(ts.vote_down, 0)::int as vote_down,
        coalesce(ts.use_count, 0)::int as use_count,
@@ -648,6 +653,7 @@ async function listTimelineSongs(searchText = "") {
     durationSeconds: Number(row.duration_seconds || 0),
     timelineCount: Number(row.timeline_count || 0),
     markerCount: Number(row.marker_count || 0),
+    pendingModulationCount: Number(row.pending_modulation_count || 0),
     voteUp: Number(row.vote_up || 0),
     voteDown: Number(row.vote_down || 0),
     useCount: Number(row.use_count || 0),
@@ -1518,7 +1524,7 @@ app.get("/admin/timelines", (req, res) => {
     </div><div id="summaryText" class="muted" style="margin-top:12px">Chua tai du lieu.</div></section>
     <section class="card"><div class="toolbar"><h2 style="margin:0">Bai da upload</h2><span class="pill" id="songCount">0 bai</span></div>
       <div class="row" style="margin-bottom:12px">
-        <div><label style="margin-top:0">Loc theo ten bai</label><select id="titleFilter"><option value="all">Tat ca bai</option><option value="karaoke">Co Beat hoac Karaoke</option><option value="non-karaoke">Khong co Beat/Karaoke</option></select></div>
+        <div><label style="margin-top:0">Loc theo ten bai</label><select id="titleFilter"><option value="all">Tat ca bai</option><option value="karaoke">Co Beat hoac Karaoke</option><option value="non-karaoke">Khong co Beat/Karaoke</option><option value="pending-modulation">Cho duyet len tone</option></select></div>
         <div style="flex:0 0 auto;min-width:0;align-self:end;padding-bottom:8px"><label class="inline-check"><input id="showYoutubeId" type="checkbox" /><span>Hiện ID YouTube</span></label></div>
         <div style="flex:0 0 auto;min-width:0;align-self:end"><button id="deleteSelectedSongsBtn" class="danger" type="button" disabled>Xoa cac bai da chon</button></div>
         <div id="selectionSummary" class="muted" style="flex:0 0 auto;min-width:120px;align-self:end;padding-bottom:9px">Da chon 0 bai</div>
@@ -1551,19 +1557,20 @@ app.get("/admin/timelines", (req, res) => {
     function formatTime(seconds){ seconds=Math.max(0,Math.floor(Number(seconds)||0)); const m=Math.floor(seconds/60); const s=seconds%60; return m+":"+String(s).padStart(2,"0"); }
     function pickBestAggregateMarkers(markers){ markers=Array.isArray(markers)?markers:[]; const byAccuracy=(a,b)=>(Number(b.confidence)||0)-(Number(a.confidence)||0)||(Number(b.supportCount)||0)-(Number(a.supportCount)||0)||(Number(a.timeMs)||0)-(Number(b.timeMs)||0); const bestInitial=markers.filter(marker=>marker.markerType==="initial_key").sort(byAccuracy)[0]; const bestModulation=markers.filter(marker=>marker.markerType!=="initial_key").sort(byAccuracy)[0]; return [bestInitial,bestModulation].filter(Boolean); }
     function renderAggregateMarkers(markers, compact=false){ markers=compact?pickBestAggregateMarkers(markers):(Array.isArray(markers)?markers:[]); if(!markers.length) return '<span class="muted">Chua co ket qua tong hop</span>'; return '<div class="summary-lines">'+markers.slice(0,compact?2:4).map(marker=>{ const percent=Math.round(Math.max(0,Math.min(1,Number(marker.confidence)||0))*100); const label=marker.markerType==="initial_key"?"Dau bai":"Len tone"; return '<div class="summary-line"><span class="pill">'+escapeText(label)+'</span><span class="summary-key">'+escapeText(marker.key)+' '+escapeText(marker.scale)+'</span><span class="summary-meta">'+percent+'%</span><span class="muted">@ '+escapeText(formatTime((marker.timeMs||0)/1000))+'</span><span class="muted">support '+escapeText(marker.supportCount||0)+'</span></div>'; }).join("")+'</div>'; }
+    function renderPendingModulationBadge(song){ const count=Number(song?.pendingModulationCount||0); if(count<=0) return ""; return '<div class="summary-line" style="margin-top:6px"><span class="pill" style="background:rgba(234,179,8,.18);color:#fde68a">Cho duyet len tone '+escapeText(count)+'</span></div>'; }
     async function api(path, body){ const res=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); const text=await res.text(); let data; try{data=JSON.parse(text)}catch{data={ok:false,message:text}} if(!res.ok) throw data; return data; }
     async function loadSongs(){ try{ const q=encodeURIComponent($("searchBox").value.trim()); const res=await fetch("/api/admin/timeline-songs?adminToken="+encodeURIComponent(getToken())+"&q="+q); const data=await res.json(); if(!res.ok) throw data; songs=data.songs||[]; selectedSongIds.clear(); showResult(data); renderSongs(); }catch(e){ showResult(e); } }
     async function showSong(songId){ try{ const res=await fetch("/api/admin/timeline-songs/"+encodeURIComponent(songId)+"?adminToken="+encodeURIComponent(getToken())); const data=await res.json(); if(!res.ok) throw data; selectedSong=data.song; showResult(data); renderDetail(data.song); }catch(e){ showResult(e); } }
     async function deleteTimeline(timelineId){ if(!confirm("Xoa timeline #"+timelineId+"?")) return; try{ const data=await api("/api/admin/delete-timeline",{adminToken:getToken(),timelineId}); showResult(data); if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
     async function deleteSong(songId){ const song=songs.find(item=>item.songId===String(songId)); if(!confirm("Xoa ca bai nay va tat ca timeline?\\n\\n"+(song?.title||song?.youtubeVideoId||songId))) return; try{ const data=await api("/api/admin/delete-timeline-song",{adminToken:getToken(),songId}); showResult(data); selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; await loadSongs(); }catch(e){ showResult(e); } }
     function isKaraokeTitle(song){ const title=String(song?.title||"").toLocaleLowerCase(); return title.includes("beat")||title.includes("karaoke"); }
-    function getFilteredSongs(){ const filter=$("titleFilter").value; if(filter==="karaoke") return songs.filter(isKaraokeTitle); if(filter==="non-karaoke") return songs.filter(song=>!isKaraokeTitle(song)); return songs; }
+    function getFilteredSongs(){ const filter=$("titleFilter").value; if(filter==="karaoke") return songs.filter(isKaraokeTitle); if(filter==="non-karaoke") return songs.filter(song=>!isKaraokeTitle(song)); if(filter==="pending-modulation") return songs.filter(song=>Number(song.pendingModulationCount||0)>0); return songs; }
     function updateSelectionUi(){ const visible=getFilteredSongs(); const selectedVisible=visible.filter(song=>selectedSongIds.has(String(song.songId))).length; const all=$("selectAllSongs"); all.checked=visible.length>0&&selectedVisible===visible.length; all.indeterminate=selectedVisible>0&&selectedVisible<visible.length; $("selectionSummary").textContent="Da chon "+selectedSongIds.size+" bai"; $("deleteSelectedSongsBtn").disabled=selectedSongIds.size===0; }
     function toggleSongSelection(songId,checked){ if(checked) selectedSongIds.add(String(songId)); else selectedSongIds.delete(String(songId)); updateSelectionUi(); }
     function toggleSelectAllFiltered(checked){ for(const song of getFilteredSongs()){ if(checked) selectedSongIds.add(String(song.songId)); else selectedSongIds.delete(String(song.songId)); } renderSongs(); }
     function applyTitleFilter(){ selectedSongIds.clear(); renderSongs(); }
     async function deleteSelectedSongs(){ const ids=[...selectedSongIds]; if(!ids.length) return; if(!confirm("Xoa vinh vien "+ids.length+" bai da chon va toan bo timeline/hop am lien quan?")) return; try{ const data=await api("/api/admin/delete-timeline-songs",{adminToken:getToken(),songIds:ids}); showResult(data); if(selectedSong&&ids.includes(String(selectedSong.songId))){ selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; } await loadSongs(); }catch(e){ showResult(e); } }
-    function renderSongs(){ const visible=getFilteredSongs(); $("songCount").textContent=visible.length+" / "+songs.length+" bai"; $("summaryText").textContent="Dang hien thi "+visible.length+" tren "+songs.length+" bai."; $("songRows").innerHTML=visible.map(song=>{ const id=String(song.songId); const title=song.title||"(chua co ten)"; const youtubeUrl="https://www.youtube.com/watch?v="+encodeURIComponent(song.youtubeVideoId); const checked=selectedSongIds.has(id)?" checked":""; return '<tr><td style="text-align:center"><input type="checkbox"'+checked+' onchange="toggleSongSelection(\\''+escapeText(id)+'\\',this.checked)" /></td><td><b class="youtube-id">'+escapeText(song.youtubeVideoId)+'</b><div><a href="'+youtubeUrl+'" target="_blank">Mo YouTube</a></div></td><td>'+escapeText(title)+'<div class="muted">'+escapeText(song.artist||"")+'</div></td><td>'+escapeText(formatTime(song.durationSeconds))+'</td><td>'+renderAggregateMarkers(song.aggregateMarkers,true)+'</td><td>'+escapeText(formatDate(song.lastTimelineAt||song.updatedAt))+'</td><td class="actions"><button class="secondary" onclick="showSong(\\''+escapeText(id)+'\\')">Chi tiet</button><button class="danger" onclick="deleteSong(\\''+escapeText(id)+'\\')">Xoa bai</button></td></tr>'; }).join(""); updateSelectionUi(); }
+    function renderSongs(){ const visible=getFilteredSongs(); $("songCount").textContent=visible.length+" / "+songs.length+" bai"; $("summaryText").textContent="Dang hien thi "+visible.length+" tren "+songs.length+" bai."; $("songRows").innerHTML=visible.map(song=>{ const id=String(song.songId); const title=song.title||"(chua co ten)"; const youtubeUrl="https://www.youtube.com/watch?v="+encodeURIComponent(song.youtubeVideoId); const checked=selectedSongIds.has(id)?" checked":""; return '<tr><td style="text-align:center"><input type="checkbox"'+checked+' onchange="toggleSongSelection(\\''+escapeText(id)+'\\',this.checked)" /></td><td><b class="youtube-id">'+escapeText(song.youtubeVideoId)+'</b><div><a href="'+youtubeUrl+'" target="_blank">Mo YouTube</a></div></td><td>'+escapeText(title)+'<div class="muted">'+escapeText(song.artist||"")+'</div></td><td>'+escapeText(formatTime(song.durationSeconds))+'</td><td>'+renderAggregateMarkers(song.aggregateMarkers,true)+renderPendingModulationBadge(song)+'</td><td>'+escapeText(formatDate(song.lastTimelineAt||song.updatedAt))+'</td><td class="actions"><button class="secondary" onclick="showSong(\\''+escapeText(id)+'\\')">Chi tiet</button><button class="danger" onclick="deleteSong(\\''+escapeText(id)+'\\')">Xoa bai</button></td></tr>'; }).join(""); updateSelectionUi(); }
     async function setMarkerConfirmation(markerId,status){ const label=status==="verified"?"duyet":status==="rejected"?"tu choi/thu hoi":"dua ve cho"; if(!confirm("Admin "+label+" moc len tone nay?")) return; try{ const data=await api("/api/admin/set-marker-confirmation",{adminToken:getToken(),markerId,status}); showResult(data); if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
     function renderDetail(song){
       const timelines=song.timelines||[];
