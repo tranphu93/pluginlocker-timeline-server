@@ -647,8 +647,9 @@ async function listTimelineSongs(searchText = "") {
          )::int as pending_modulation_count
          ,
          count(m.id) filter (
-           where coalesce(m.confirmation_status, 'pending') = 'pending'
-             and coalesce(m.confidence, 1) < $${values.length + 1}
+           where coalesce(m.confidence, 1) < $${values.length + 1}
+             and coalesce(m.admin_approved, false) = false
+             and coalesce(m.confirmation_status, 'pending') <> 'rejected'
          )::int as pending_low_confidence_count
        from song_timelines t
        left join timeline_markers m on m.timeline_id = t.id
