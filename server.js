@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const TIMELINE_ADMIN_TOKEN = process.env.TIMELINE_ADMIN_TOKEN || "timeline-admin-123";
 const TIMELINE_MATCH_TOLERANCE_MS = 5000;
+const LOW_CONFIDENCE_REVIEW_THRESHOLD = 0.25;
 
 if (!DATABASE_URL) {
   console.warn("DATABASE_URL is not set. Timeline server needs a separate Supabase/PostgreSQL database.");
@@ -210,8 +211,8 @@ function aggregateTimelineMarkers(rows, timelineCount) {
         score: 0,
         supportCount: 0,
         adminApproved: false,
-        confirmationStatus: marker.markerType === "initial_key" ? "verified" : "pending",
-        confirmed: marker.markerType === "initial_key",
+        confirmationStatus: marker.markerType === "initial_key" && marker.confirmationStatus !== "rejected" ? "verified" : "pending",
+        confirmed: marker.markerType === "initial_key" && marker.confirmationStatus !== "rejected",
         timeCandidates: []
       };
       clusters.push(cluster);
@@ -272,13 +273,13 @@ function aggregateTimelineMarkers(rows, timelineCount) {
       : winner.confirmationSupportCount;
     cluster.adminApproved = winner.adminApproved;
     cluster.confirmationStatus = marker.markerType === "initial_key"
-      ? "verified"
+      ? (winner.confirmationStatus === "rejected" ? "rejected" : "verified")
       : winner.confirmationStatus;
     cluster.confirmed = cluster.confirmationStatus === "verified";
   }
 
   const aggregateMarkers = clusters
-    .filter(cluster => cluster.score >= 0.25 && cluster.confirmed)
+    .filter(cluster => (cluster.score >= LOW_CONFIDENCE_REVIEW_THRESHOLD || cluster.adminApproved) && cluster.confirmed)
     .sort((a, b) => a.timeMs - b.timeMs || b.score - a.score)
     .reduce((markers, cluster) => {
       const previous = markers[markers.length - 1];
@@ -301,7 +302,7 @@ function aggregateTimelineMarkers(rows, timelineCount) {
       key: cluster.key,
       scale: cluster.scale,
       markerType: cluster.markerType,
-      confidence: clusterConfidence(cluster, timelineCount),
+      confidence: cluster.adminApproved ? 1 : clusterConfidence(cluster, timelineCount),
       supportCount: cluster.supportCount,
       adminApproved: cluster.adminApproved,
       confirmed: cluster.confirmed,
@@ -644,6 +645,11 @@ async function listTimelineSongs(searchText = "") {
            where m.marker_type = 'modulation'
              and coalesce(m.confirmation_status, 'pending') = 'pending'
          )::int as pending_modulation_count
+         ,
+         count(m.id) filter (
+           where coalesce(m.confirmation_status, 'pending') = 'pending'
+             and coalesce(m.confidence, 1) < $${values.length + 1}
+         )::int as pending_low_confidence_count
        from song_timelines t
        left join timeline_markers m on m.timeline_id = t.id
        where t.song_id in (select id from filtered_songs)
@@ -660,6 +666,7 @@ async function listTimelineSongs(searchText = "") {
        coalesce(ts.timeline_count, 0)::int as timeline_count,
        coalesce(ms.marker_count, 0)::int as marker_count,
        coalesce(ms.pending_modulation_count, 0)::int as pending_modulation_count,
+       coalesce(ms.pending_low_confidence_count, 0)::int as pending_low_confidence_count,
        coalesce(ts.vote_up, 0)::int as vote_up,
        coalesce(ts.vote_down, 0)::int as vote_down,
        coalesce(ts.use_count, 0)::int as use_count,
@@ -669,7 +676,7 @@ async function listTimelineSongs(searchText = "") {
      left join marker_stats ms on ms.song_id = s.id
      order by coalesce(ts.last_timeline_at, s.updated_at) desc
      limit 300`,
-    values
+    [...values, LOW_CONFIDENCE_REVIEW_THRESHOLD]
   );
 
   const songs = result.rows.map(row => ({
@@ -681,6 +688,7 @@ async function listTimelineSongs(searchText = "") {
     timelineCount: Number(row.timeline_count || 0),
     markerCount: Number(row.marker_count || 0),
     pendingModulationCount: Number(row.pending_modulation_count || 0),
+    pendingLowConfidenceCount: Number(row.pending_low_confidence_count || 0),
     voteUp: Number(row.vote_up || 0),
     voteDown: Number(row.vote_down || 0),
     useCount: Number(row.use_count || 0),
@@ -903,7 +911,8 @@ async function setTimelineMarkerConfirmation(markerId, requestedStatus) {
       `select m.*, t.song_id
        from timeline_markers m
        join song_timelines t on t.id = m.timeline_id
-       where m.id = $1 and m.marker_type = 'modulation'
+       where m.id = $1
+         and m.marker_type in ('initial_key', 'modulation')
        for update`,
       [normalizedMarkerId]
     );
@@ -920,12 +929,12 @@ async function setTimelineMarkerConfirmation(markerId, requestedStatus) {
        from song_timelines t
        where m.timeline_id = t.id
          and t.song_id = $1
-         and m.marker_type = 'modulation'
+         and m.marker_type = $6
          and m.key = $2
          and m.scale = $3
          and abs(m.time_ms - $4) <= 1000
        returning m.id`,
-      [marker.song_id, marker.key, marker.scale, marker.time_ms, status]
+      [marker.song_id, marker.key, marker.scale, marker.time_ms, status, marker.marker_type]
     );
     await client.query("commit");
     return {
@@ -1465,7 +1474,7 @@ app.post("/api/admin/approve-timeline-marker", async (req, res) => {
     if (!checkTimelineAdminToken(req, res)) return;
     const marker = await setTimelineMarkerConfirmation(req.body.markerId, "verified");
     if (!marker) {
-      return res.status(404).json({ ok: false, message: "Modulation marker not found." });
+      return res.status(404).json({ ok: false, message: "Timeline marker not found." });
     }
     return res.json({
       ok: true,
@@ -1484,7 +1493,7 @@ app.post("/api/admin/set-marker-confirmation", async (req, res) => {
     if (!checkTimelineAdminToken(req, res)) return;
     const marker = await setTimelineMarkerConfirmation(req.body.markerId, req.body.status);
     if (!marker) {
-      return res.status(404).json({ ok: false, message: "Modulation marker or status not valid." });
+      return res.status(404).json({ ok: false, message: "Timeline marker or status not valid." });
     }
     return res.json({ ok: true, message: "Da cap nhat trang thai xac nhan.", ...marker });
   } catch (error) {
@@ -1626,7 +1635,7 @@ app.get("/admin/timelines", (req, res) => {
     </div><div id="summaryText" class="muted" style="margin-top:12px">Chua tai du lieu.</div></section>
     <section class="card"><div class="toolbar"><h2 style="margin:0">Bai da upload</h2><span class="pill" id="songCount">0 bai</span></div>
       <div class="row" style="margin-bottom:12px">
-        <div><label style="margin-top:0">Loc theo ten bai</label><select id="titleFilter"><option value="all">Tat ca bai</option><option value="karaoke">Co Beat hoac Karaoke</option><option value="non-karaoke">Khong co Beat/Karaoke</option><option value="pending-modulation">Cho duyet len tone</option></select></div>
+        <div><label style="margin-top:0">Loc theo ten bai</label><select id="titleFilter"><option value="all">Tat ca bai</option><option value="karaoke">Co Beat hoac Karaoke</option><option value="non-karaoke">Khong co Beat/Karaoke</option><option value="pending-modulation">Cho duyet len tone</option><option value="pending-low-confidence">Cho duyet conf thap</option></select></div>
         <div style="flex:0 0 auto;min-width:0;align-self:end;padding-bottom:8px"><label class="inline-check"><input id="showYoutubeId" type="checkbox" /><span>Hiện ID YouTube</span></label></div>
         <div style="flex:0 0 auto;min-width:0;align-self:end"><button id="deleteSelectedSongsBtn" class="danger" type="button" disabled>Xoa cac bai da chon</button></div>
         <div id="selectionSummary" class="muted" style="flex:0 0 auto;min-width:120px;align-self:end;padding-bottom:9px">Da chon 0 bai</div>
@@ -1645,7 +1654,7 @@ app.get("/admin/timelines", (req, res) => {
     </section>
   </main>
   <script>
-    let songs = []; let selectedSong = null; let editingMarkerId = ""; const selectedSongIds = new Set(); const $ = id => document.getElementById(id);
+    let songs = []; let selectedSong = null; let editingMarkerId = ""; const selectedSongIds = new Set(); const lowConfidenceReviewThreshold = 0.25; const $ = id => document.getElementById(id);
     function getToken(){ return $("adminToken").value.trim(); }
     function restoreToken(){ const params=new URLSearchParams(window.location.search); const urlToken=params.get("adminToken")||""; const storedToken=localStorage.getItem("pluginlockerTimelineAdminToken")||""; $("adminToken").value=urlToken||storedToken; if(urlToken){ localStorage.setItem("pluginlockerTimelineAdminToken",urlToken); window.history.replaceState({},document.title,window.location.pathname); } }
     function saveToken(){ localStorage.setItem("pluginlockerTimelineAdminToken", getToken()); showResult({ok:true,message:"Da luu timeline token trong trinh duyet nay."}); }
@@ -1660,6 +1669,7 @@ app.get("/admin/timelines", (req, res) => {
     function pickBestAggregateMarkers(markers){ markers=Array.isArray(markers)?markers:[]; const byAccuracy=(a,b)=>(Number(b.confidence)||0)-(Number(a.confidence)||0)||(Number(b.supportCount)||0)-(Number(a.supportCount)||0)||(Number(a.timeMs)||0)-(Number(b.timeMs)||0); const bestInitial=markers.filter(marker=>marker.markerType==="initial_key").sort(byAccuracy)[0]; const bestModulation=markers.filter(marker=>marker.markerType!=="initial_key").sort(byAccuracy)[0]; return [bestInitial,bestModulation].filter(Boolean); }
     function renderAggregateMarkers(markers, compact=false){ markers=compact?pickBestAggregateMarkers(markers):(Array.isArray(markers)?markers:[]); if(!markers.length) return '<span class="muted">Chua co ket qua tong hop</span>'; return '<div class="summary-lines">'+markers.slice(0,compact?2:4).map(marker=>{ const percent=Math.round(Math.max(0,Math.min(1,Number(marker.confidence)||0))*100); const label=marker.markerType==="initial_key"?"Dau bai":"Len tone"; return '<div class="summary-line"><span class="pill">'+escapeText(label)+'</span><span class="summary-key">'+escapeText(marker.key)+' '+escapeText(marker.scale)+'</span><span class="summary-meta">'+percent+'%</span><span class="muted">@ '+escapeText(formatTime((marker.timeMs||0)/1000))+'</span><span class="muted">support '+escapeText(marker.supportCount||0)+'</span></div>'; }).join("")+'</div>'; }
     function renderPendingModulationBadge(song){ const count=Number(song?.pendingModulationCount||0); if(count<=0) return ""; return '<div class="summary-line" style="margin-top:6px"><span class="pill" style="background:rgba(234,179,8,.18);color:#fde68a">Cho duyet len tone '+escapeText(count)+'</span></div>'; }
+    function renderPendingLowConfidenceBadge(song){ const count=Number(song?.pendingLowConfidenceCount||0); if(count<=0) return ""; return '<div class="summary-line" style="margin-top:6px"><span class="pill" style="background:rgba(234,179,8,.18);color:#fde68a">Cho duyet conf thap '+escapeText(count)+'</span></div>'; }
     async function api(path, body){ const res=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); const text=await res.text(); let data; try{data=JSON.parse(text)}catch{data={ok:false,message:text}} if(!res.ok) throw data; return data; }
     async function loadSongs(){ try{ const q=encodeURIComponent($("searchBox").value.trim()); const res=await fetch("/api/admin/timeline-songs?adminToken="+encodeURIComponent(getToken())+"&q="+q); const data=await res.json(); if(!res.ok) throw data; songs=data.songs||[]; selectedSongIds.clear(); showResult(data); renderSongs(); }catch(e){ showResult(e); } }
     async function showSong(songId){ try{ const res=await fetch("/api/admin/timeline-songs/"+encodeURIComponent(songId)+"?adminToken="+encodeURIComponent(getToken())); const data=await res.json(); if(!res.ok) throw data; selectedSong=data.song; showResult(data); renderDetail(data.song); }catch(e){ showResult(e); } }
@@ -1668,15 +1678,15 @@ app.get("/admin/timelines", (req, res) => {
     async function deleteTimeline(timelineId){ if(!confirm("Xoa timeline #"+timelineId+"?")) return; try{ const data=await api("/api/admin/delete-timeline",{adminToken:getToken(),timelineId}); showResult(data); if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
     async function deleteSong(songId){ const song=songs.find(item=>item.songId===String(songId)); if(!confirm("Xoa ca bai nay va tat ca timeline?\\n\\n"+(song?.title||song?.youtubeVideoId||songId))) return; try{ const data=await api("/api/admin/delete-timeline-song",{adminToken:getToken(),songId}); showResult(data); selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; await loadSongs(); }catch(e){ showResult(e); } }
     function isKaraokeTitle(song){ const title=String(song?.title||"").toLocaleLowerCase(); return title.includes("beat")||title.includes("karaoke"); }
-    function getFilteredSongs(){ const filter=$("titleFilter").value; if(filter==="karaoke") return songs.filter(isKaraokeTitle); if(filter==="non-karaoke") return songs.filter(song=>!isKaraokeTitle(song)); if(filter==="pending-modulation") return songs.filter(song=>Number(song.pendingModulationCount||0)>0); return songs; }
+    function getFilteredSongs(){ const filter=$("titleFilter").value; if(filter==="karaoke") return songs.filter(isKaraokeTitle); if(filter==="non-karaoke") return songs.filter(song=>!isKaraokeTitle(song)); if(filter==="pending-modulation") return songs.filter(song=>Number(song.pendingModulationCount||0)>0); if(filter==="pending-low-confidence") return songs.filter(song=>Number(song.pendingLowConfidenceCount||0)>0); return songs; }
     function updateSelectionUi(){ const visible=getFilteredSongs(); const selectedVisible=visible.filter(song=>selectedSongIds.has(String(song.songId))).length; const all=$("selectAllSongs"); all.checked=visible.length>0&&selectedVisible===visible.length; all.indeterminate=selectedVisible>0&&selectedVisible<visible.length; $("selectionSummary").textContent="Da chon "+selectedSongIds.size+" bai"; $("deleteSelectedSongsBtn").disabled=selectedSongIds.size===0; }
     function toggleSongSelection(songId,checked){ if(checked) selectedSongIds.add(String(songId)); else selectedSongIds.delete(String(songId)); updateSelectionUi(); }
     function toggleSelectAllFiltered(checked){ for(const song of getFilteredSongs()){ if(checked) selectedSongIds.add(String(song.songId)); else selectedSongIds.delete(String(song.songId)); } renderSongs(); }
     function applyTitleFilter(){ selectedSongIds.clear(); renderSongs(); }
     async function deleteSelectedSongs(){ const ids=[...selectedSongIds]; if(!ids.length) return; if(!confirm("Xoa vinh vien "+ids.length+" bai da chon va toan bo timeline/hop am lien quan?")) return; try{ const data=await api("/api/admin/delete-timeline-songs",{adminToken:getToken(),songIds:ids}); showResult(data); if(selectedSong&&ids.includes(String(selectedSong.songId))){ selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; } await loadSongs(); }catch(e){ showResult(e); } }
     function renderAggregateEditButtons(song){ const id=String(song.songId); return pickBestAggregateMarkers(song.aggregateMarkers).map(marker=>{ const label=marker.markerType==="initial_key"?"Edit dau":"Edit len"; return '<button class="secondary" onclick="editSongAggregate(\\''+escapeText(id)+'\\',\\''+escapeText(marker.markerType)+'\\','+escapeText(Number(marker.timeMs)||0)+',\\''+escapeText(marker.key)+'\\',\\''+escapeText(marker.scale)+'\\')">'+escapeText(label)+'</button>'; }).join(""); }
-    function renderSongs(){ const visible=getFilteredSongs(); $("songCount").textContent=visible.length+" / "+songs.length+" bai"; $("summaryText").textContent="Dang hien thi "+visible.length+" tren "+songs.length+" bai."; $("songRows").innerHTML=visible.map(song=>{ const id=String(song.songId); const title=song.title||"(chua co ten)"; const youtubeUrl="https://www.youtube.com/watch?v="+encodeURIComponent(song.youtubeVideoId); const checked=selectedSongIds.has(id)?" checked":""; return '<tr><td style="text-align:center"><input type="checkbox"'+checked+' onchange="toggleSongSelection(\\''+escapeText(id)+'\\',this.checked)" /></td><td><b class="youtube-id">'+escapeText(song.youtubeVideoId)+'</b><div><a href="'+youtubeUrl+'" target="_blank">Mo YouTube</a></div></td><td>'+escapeText(title)+'<div class="muted">'+escapeText(song.artist||"")+'</div></td><td>'+escapeText(formatTime(song.durationSeconds))+'</td><td>'+renderAggregateMarkers(song.aggregateMarkers,true)+renderPendingModulationBadge(song)+'</td><td>'+escapeText(formatDate(song.lastTimelineAt||song.updatedAt))+'</td><td class="actions"><button class="secondary" onclick="showSong(\\''+escapeText(id)+'\\')">Chi tiet</button><button class="danger" onclick="deleteSong(\\''+escapeText(id)+'\\')">Xoa bai</button>'+renderAggregateEditButtons(song)+'</td></tr>'; }).join(""); updateSelectionUi(); }
-    async function setMarkerConfirmation(markerId,status){ const label=status==="verified"?"duyet":status==="rejected"?"tu choi/thu hoi":"dua ve cho"; if(!confirm("Admin "+label+" moc len tone nay?")) return; try{ const data=await api("/api/admin/set-marker-confirmation",{adminToken:getToken(),markerId,status}); showResult(data); if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
+    function renderSongs(){ const visible=getFilteredSongs(); $("songCount").textContent=visible.length+" / "+songs.length+" bai"; $("summaryText").textContent="Dang hien thi "+visible.length+" tren "+songs.length+" bai."; $("songRows").innerHTML=visible.map(song=>{ const id=String(song.songId); const title=song.title||"(chua co ten)"; const youtubeUrl="https://www.youtube.com/watch?v="+encodeURIComponent(song.youtubeVideoId); const checked=selectedSongIds.has(id)?" checked":""; return '<tr><td style="text-align:center"><input type="checkbox"'+checked+' onchange="toggleSongSelection(\\''+escapeText(id)+'\\',this.checked)" /></td><td><b class="youtube-id">'+escapeText(song.youtubeVideoId)+'</b><div><a href="'+youtubeUrl+'" target="_blank">Mo YouTube</a></div></td><td>'+escapeText(title)+'<div class="muted">'+escapeText(song.artist||"")+'</div></td><td>'+escapeText(formatTime(song.durationSeconds))+'</td><td>'+renderAggregateMarkers(song.aggregateMarkers,true)+renderPendingModulationBadge(song)+renderPendingLowConfidenceBadge(song)+'</td><td>'+escapeText(formatDate(song.lastTimelineAt||song.updatedAt))+'</td><td class="actions"><button class="secondary" onclick="showSong(\\''+escapeText(id)+'\\')">Chi tiet</button><button class="danger" onclick="deleteSong(\\''+escapeText(id)+'\\')">Xoa bai</button>'+renderAggregateEditButtons(song)+'</td></tr>'; }).join(""); updateSelectionUi(); }
+    async function setMarkerConfirmation(markerId,status){ const label=status==="verified"?"duyet":status==="rejected"?"tu choi/thu hoi":"dua ve cho"; if(!confirm("Admin "+label+" moc timeline nay?")) return; try{ const data=await api("/api/admin/set-marker-confirmation",{adminToken:getToken(),markerId,status}); showResult(data); if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
     function editMarker(markerId){ editingMarkerId=String(markerId||""); if(selectedSong) renderDetail(selectedSong); }
     function cancelEditMarker(){ editingMarkerId=""; if(selectedSong) renderDetail(selectedSong); }
     async function saveMarker(markerId){ const id=String(markerId||""); try{ const data=await api("/api/admin/update-timeline-marker",{adminToken:getToken(),markerId:id,timeText:$("markerTime-"+id).value,key:$("markerKey-"+id).value,scale:$("markerScale-"+id).value}); showResult(data); editingMarkerId=""; if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
@@ -1689,17 +1699,27 @@ app.get("/admin/timelines", (req, res) => {
         const markers=timeline.markers||[];
         const markerRows=markers.map(marker=>{
           const isInitial=marker.markerType==="initial_key";
+          const isLowConfidence=(Number(marker.confidence)||0)<lowConfidenceReviewThreshold;
           const support=Math.min(3,Number(marker.confirmationSupportCount)||0);
           let status;
           if(isInitial){
-            status='<span class="pill">Dau bai</span>';
+            if(marker.adminApproved){
+              status='<span class="pill" style="background:rgba(34,197,94,.18);color:#86efac">Admin da duyet</span> <button class="danger" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'rejected\\')">Thu hoi</button>';
+            }else if(marker.confirmationStatus==="rejected"){
+              status='<span class="pill" style="background:rgba(220,38,38,.18);color:#fca5a5">Da tu choi</span> <button class="secondary" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'verified\\')">Admin duyet</button>';
+            }else if(isLowConfidence){
+              status='<span class="pill">Dau bai</span> <span class="muted">Cho duyet conf thap</span> <button class="secondary" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'verified\\')">Admin duyet</button> <button class="danger" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'rejected\\')">Tu choi</button>';
+            }else{
+              status='<span class="pill">Dau bai</span>';
+            }
           }else if(marker.confirmationStatus==="verified"){
             const verifiedLabel=marker.adminApproved?'Admin da duyet':'Da xac nhan '+support+'/3 may';
             status='<span class="pill" style="background:rgba(34,197,94,.18);color:#86efac">'+verifiedLabel+'</span> <button class="danger" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'rejected\\')">Thu hoi</button>';
           }else if(marker.confirmationStatus==="rejected"){
             status='<span class="pill" style="background:rgba(220,38,38,.18);color:#fca5a5">Da tu choi</span> <button class="secondary" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'verified\\')">Admin duyet</button>';
           }else{
-            status='<span class="muted">Cho xac nhan '+support+'/3 may</span> <button class="secondary" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'verified\\')">Admin duyet</button> <button class="danger" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'rejected\\')">Tu choi</button>';
+            const pendingLabel=isLowConfidence?'Cho duyet conf thap':'Cho xac nhan '+support+'/3 may';
+            status='<span class="muted">'+pendingLabel+'</span> <button class="secondary" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'verified\\')">Admin duyet</button> <button class="danger" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'rejected\\')">Tu choi</button>';
           }
           return renderMarkerRow(marker,status);
         }).join("");
