@@ -125,6 +125,33 @@ function parseTimelineMarkers(markers) {
     .slice(0, 64);
 }
 
+function parseAdminMarkerTimeMs(body) {
+  if (body && body.timeMs !== undefined) {
+    const timeMs = Math.floor(Number(body.timeMs));
+    return Number.isFinite(timeMs) ? Math.max(0, timeMs) : null;
+  }
+
+  const text = String(body?.timeText || body?.time || "").trim();
+  if (!text) {
+    return null;
+  }
+
+  if (/^\d+(\.\d+)?$/.test(text)) {
+    return Math.max(0, Math.round(Number(text) * 1000));
+  }
+
+  const parts = text.split(":").map(part => part.trim());
+  if (parts.length < 2 || parts.length > 3 || parts.some(part => !/^\d+(\.\d+)?$/.test(part))) {
+    return null;
+  }
+
+  const numbers = parts.map(Number);
+  const seconds = parts.length === 3
+    ? (numbers[0] * 3600) + (numbers[1] * 60) + numbers[2]
+    : (numbers[0] * 60) + numbers[1];
+  return Math.max(0, Math.round(seconds * 1000));
+}
+
 function checkTimelineAdminToken(req, res) {
   const body = req.body || {};
   const query = req.query || {};
@@ -802,6 +829,59 @@ async function deleteTimeline(timelineId) {
   return result.rows.length > 0;
 }
 
+async function updateTimelineMarker({ markerId, timeMs, key, scale }) {
+  const normalizedMarkerId = Math.floor(Number(markerId || 0));
+  if (!normalizedMarkerId) {
+    return null;
+  }
+
+  const normalizedKey = normalizeTimelineKey(key);
+  const normalizedScale = normalizeScale(scale);
+  if (!normalizedKey || !normalizedScale || timeMs === null || timeMs === undefined) {
+    return null;
+  }
+
+  const now = nowSeconds();
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const markerResult = await client.query(
+      `update timeline_markers
+       set time_ms = $2, key = $3, scale = $4
+       where id = $1
+       returning id, timeline_id, time_ms, key, scale, marker_type, confidence`,
+      [normalizedMarkerId, timeMs, normalizedKey, normalizedScale]
+    );
+
+    const marker = markerResult.rows[0];
+    if (!marker) {
+      await client.query("rollback");
+      return null;
+    }
+
+    await client.query(
+      "update song_timelines set updated_at = $2 where id = $1",
+      [marker.timeline_id, now]
+    );
+    await client.query("commit");
+
+    return {
+      markerId: String(marker.id),
+      timelineId: String(marker.timeline_id),
+      timeMs: Number(marker.time_ms || 0),
+      key: marker.key || "",
+      scale: marker.scale || "",
+      markerType: marker.marker_type || "",
+      confidence: Number(marker.confidence || 0)
+    };
+  } catch (error) {
+    await client.query("rollback").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function deleteTimelineSong(songId) {
   const normalizedSongId = Math.floor(Number(songId || 0));
   if (!normalizedSongId) {
@@ -1358,6 +1438,28 @@ app.post("/api/admin/delete-timeline", async (req, res) => {
   }
 });
 
+app.post("/api/admin/update-timeline-marker", async (req, res) => {
+  try {
+    if (!checkTimelineAdminToken(req, res)) return;
+    const body = req.body || {};
+    const timeMs = parseAdminMarkerTimeMs(body);
+    const marker = await updateTimelineMarker({
+      markerId: body.markerId,
+      timeMs,
+      key: body.key,
+      scale: body.scale
+    });
+
+    if (!marker) {
+      return res.status(400).json({ ok: false, message: "Invalid marker update." });
+    }
+
+    return res.json({ ok: true, message: "Timeline marker updated.", marker });
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: "Timeline marker update failed: " + error.message });
+  }
+});
+
 app.post("/api/admin/approve-timeline-marker", async (req, res) => {
   try {
     if (!checkTimelineAdminToken(req, res)) return;
@@ -1543,7 +1645,7 @@ app.get("/admin/timelines", (req, res) => {
     </section>
   </main>
   <script>
-    let songs = []; let selectedSong = null; const selectedSongIds = new Set(); const $ = id => document.getElementById(id);
+    let songs = []; let selectedSong = null; let editingMarkerId = ""; const selectedSongIds = new Set(); const $ = id => document.getElementById(id);
     function getToken(){ return $("adminToken").value.trim(); }
     function restoreToken(){ const params=new URLSearchParams(window.location.search); const urlToken=params.get("adminToken")||""; const storedToken=localStorage.getItem("pluginlockerTimelineAdminToken")||""; $("adminToken").value=urlToken||storedToken; if(urlToken){ localStorage.setItem("pluginlockerTimelineAdminToken",urlToken); window.history.replaceState({},document.title,window.location.pathname); } }
     function saveToken(){ localStorage.setItem("pluginlockerTimelineAdminToken", getToken()); showResult({ok:true,message:"Da luu timeline token trong trinh duyet nay."}); }
@@ -1572,6 +1674,10 @@ app.get("/admin/timelines", (req, res) => {
     async function deleteSelectedSongs(){ const ids=[...selectedSongIds]; if(!ids.length) return; if(!confirm("Xoa vinh vien "+ids.length+" bai da chon va toan bo timeline/hop am lien quan?")) return; try{ const data=await api("/api/admin/delete-timeline-songs",{adminToken:getToken(),songIds:ids}); showResult(data); if(selectedSong&&ids.includes(String(selectedSong.songId))){ selectedSong=null; $("detailBox").innerHTML='<span class="muted">Chon mot bai de xem timeline.</span>'; } await loadSongs(); }catch(e){ showResult(e); } }
     function renderSongs(){ const visible=getFilteredSongs(); $("songCount").textContent=visible.length+" / "+songs.length+" bai"; $("summaryText").textContent="Dang hien thi "+visible.length+" tren "+songs.length+" bai."; $("songRows").innerHTML=visible.map(song=>{ const id=String(song.songId); const title=song.title||"(chua co ten)"; const youtubeUrl="https://www.youtube.com/watch?v="+encodeURIComponent(song.youtubeVideoId); const checked=selectedSongIds.has(id)?" checked":""; return '<tr><td style="text-align:center"><input type="checkbox"'+checked+' onchange="toggleSongSelection(\\''+escapeText(id)+'\\',this.checked)" /></td><td><b class="youtube-id">'+escapeText(song.youtubeVideoId)+'</b><div><a href="'+youtubeUrl+'" target="_blank">Mo YouTube</a></div></td><td>'+escapeText(title)+'<div class="muted">'+escapeText(song.artist||"")+'</div></td><td>'+escapeText(formatTime(song.durationSeconds))+'</td><td>'+renderAggregateMarkers(song.aggregateMarkers,true)+renderPendingModulationBadge(song)+'</td><td>'+escapeText(formatDate(song.lastTimelineAt||song.updatedAt))+'</td><td class="actions"><button class="secondary" onclick="showSong(\\''+escapeText(id)+'\\')">Chi tiet</button><button class="danger" onclick="deleteSong(\\''+escapeText(id)+'\\')">Xoa bai</button></td></tr>'; }).join(""); updateSelectionUi(); }
     async function setMarkerConfirmation(markerId,status){ const label=status==="verified"?"duyet":status==="rejected"?"tu choi/thu hoi":"dua ve cho"; if(!confirm("Admin "+label+" moc len tone nay?")) return; try{ const data=await api("/api/admin/set-marker-confirmation",{adminToken:getToken(),markerId,status}); showResult(data); if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
+    function editMarker(markerId){ editingMarkerId=String(markerId||""); if(selectedSong) renderDetail(selectedSong); }
+    function cancelEditMarker(){ editingMarkerId=""; if(selectedSong) renderDetail(selectedSong); }
+    async function saveMarker(markerId){ const id=String(markerId||""); try{ const data=await api("/api/admin/update-timeline-marker",{adminToken:getToken(),markerId:id,timeText:$("markerTime-"+id).value,key:$("markerKey-"+id).value,scale:$("markerScale-"+id).value}); showResult(data); editingMarkerId=""; if(selectedSong) await showSong(selectedSong.songId); await loadSongs(); }catch(e){ showResult(e); } }
+    function renderMarkerRow(marker,status){ const markerId=String(marker.markerId||""); if(editingMarkerId===markerId){ return '<tr><td><input id="markerTime-'+escapeText(markerId)+'" value="'+escapeText(formatTime(marker.timeMs/1000))+'" /></td><td><input id="markerKey-'+escapeText(markerId)+'" value="'+escapeText(marker.key)+'" /></td><td><input id="markerScale-'+escapeText(markerId)+'" value="'+escapeText(marker.scale)+'" /></td><td>'+escapeText(marker.markerType)+'</td><td>'+escapeText(marker.confidence)+'</td><td class="actions">'+status+' <button onclick="saveMarker(\\''+escapeText(markerId)+'\\')">Luu</button> <button class="secondary" onclick="cancelEditMarker()">Huy</button></td></tr>'; } return '<tr><td>'+escapeText(formatTime(marker.timeMs/1000))+'</td><td>'+escapeText(marker.key)+'</td><td>'+escapeText(marker.scale)+'</td><td>'+escapeText(marker.markerType)+'</td><td>'+escapeText(marker.confidence)+'</td><td class="actions">'+status+' <button class="secondary" onclick="editMarker(\\''+escapeText(markerId)+'\\')">Edit</button></td></tr>'; }
     function renderDetail(song){
       const timelines=song.timelines||[];
       const stats='<div class="stat-grid"><div class="stat"><span class="muted">Timeline</span><b>'+escapeText(song.timelineCount||0)+'</b></div><div class="stat"><span class="muted">Moc</span><b>'+escapeText(song.markerCount||0)+'</b></div><div class="stat"><span class="muted">Luot dung</span><b>'+escapeText(song.useCount||0)+'</b></div></div>';
@@ -1592,7 +1698,7 @@ app.get("/admin/timelines", (req, res) => {
           }else{
             status='<span class="muted">Cho xac nhan '+support+'/3 may</span> <button class="secondary" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'verified\\')">Admin duyet</button> <button class="danger" onclick="setMarkerConfirmation(\\''+escapeText(marker.markerId)+'\\',\\'rejected\\')">Tu choi</button>';
           }
-          return '<tr><td>'+escapeText(formatTime(marker.timeMs/1000))+'</td><td>'+escapeText(marker.key)+'</td><td>'+escapeText(marker.scale)+'</td><td>'+escapeText(marker.markerType)+'</td><td>'+escapeText(marker.confidence)+'</td><td>'+status+'</td></tr>';
+          return renderMarkerRow(marker,status);
         }).join("");
         return '<div style="border:1px solid #2a2f3a;border-radius:12px;padding:12px;margin-bottom:12px"><div class="row"><div><b>Timeline #'+escapeText(timeline.timelineId)+'</b><div class="muted">source: '+escapeText(timeline.source||"-")+' | machine: '+escapeText(timeline.createdByMachineId||"-")+'</div></div><div><span class="pill">up '+escapeText(timeline.voteUp)+'</span> <span class="pill">down '+escapeText(timeline.voteDown)+'</span> <span class="pill">use '+escapeText(timeline.useCount)+'</span></div><div style="flex:0 0 auto"><button class="danger" onclick="deleteTimeline(\\''+escapeText(timeline.timelineId)+'\\')">Xoa timeline</button></div></div><div class="muted" style="margin:8px 0">updated: '+escapeText(formatDate(timeline.updatedAt))+'</div><table style="min-width:0"><thead><tr><th>Time</th><th>Key</th><th>Scale</th><th>Type</th><th>Confidence</th><th>Xac nhan</th></tr></thead><tbody>'+markerRows+'</tbody></table></div>';
       }).join("");
